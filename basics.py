@@ -60,7 +60,7 @@ def section_autodiff():
         pred = params["W"] @ x + params["b"]
         return jnp.mean((pred - y_true)**2)
     
-    key = jnp.random.PRNGKey(0)
+    key = jax.random.PRNGKey(0)
     params = {
         "W": jax.random.normal(key, (4, 3)),
         "b": jnp.zeros(4), 
@@ -77,7 +77,7 @@ def section_autodiff():
     # Higher-order derivatives 
     # grad(grad(f)) computes the second derivative, etc.
     def sigmoid(x):
-        return jax.nn.sigmoid(n)
+        return jax.nn.sigmoid(x)
     
     d1 = jax.grad(sigmoid)
     d2 = jax.grad(d1)
@@ -195,6 +195,171 @@ def section_vmap():
     xs     = jnp.ones((16, 3))
     ys     = jnp.zeros((16, 4))
     gs     = per_sample_grad(params, xs, ys)   # shape (16, 4, 3)
+
+    print(f"\n  Per-sample gradients shape: {gs.shape}   "
+          f"(batch × out_dim × in_dim)")
+    print(f"  Per-sample grad norms: {jnp.linalg.norm(gs.reshape(16, -1), axis=1)}")
+
+    # Composing transformations 
+    fast_per_sample = jax.jit(per_sample_grad)
+    _ = fast_per_sample(params, xs, ys)      # warm-up
+    print("\n  jit(vmap(grad(...))) compiles cleanly ")
+
+
+# §4  PRNG / RANDOM NUMBERS
+
+def section_random():
+    print("\n" + "─" * 60)
+    print("§4  PRNG — Explicit Random Keys")
+    print("─" * 60)
+
+    # JAX's PRNG is *functional*: every random operation needs an explicit
+    # key. You never modify a key in-place — you always split it.
+
+    #  Creating & splitting keys 
+    key = jax.random.PRNGKey(42)
+    print(f"\n  PRNGKey(42) = {key}")
+
+    key, subkey = jax.random.split(key)         # always split, never reuse
+    print(f"  After split: key={key}  subkey={subkey}")
+
+    keys = jax.random.split(key, num=6)          # get N keys at once
+    print(f"  Batch split → {keys.shape}")
+
+    # Common distributions
+
+    k1, k2, k3, k4, key = jax.random.split(key, 5)
+
+    normal = jax.random.normal(k1, (3, ))
+    uniform = jax.random.uniform(k2, (3, ))
+    randint  = jax.random.randint(k3, (5,), 0, 100)
+    bernoulli = jax.random.bernoulli(k4, 0.3, (8,))
+
+    print(f"\n  Normal(0,1) : {normal}")
+    print(f"  Uniform[0,1)  : {uniform}")
+    print(f"  RandInt[0,100): {randint}")
+    print(f"  Bernoulli(0.3): {bernoulli.astype(int)}")
+
+    # Weight initialisation
+    def kaiming_linear(key, fan_in, fan_out):
+        """He / Kaiming uniform initialisation."""
+        k_w, k_b = jax.random.split(key)
+        std = (2.0 / fan_in)** 0.5
+
+        W = jax.random.normal(k_w, (fan_in, fan_out)) * std
+        b   = jnp.zeros(fan_out)
+        return {"W": W, "b": b}
+    
+    key, init_key = jax.random.split(key)
+    layer = kaiming_linear(init_key, 512, 2048)
+    print(f"\n  Kaiming init Linear(512→2048):")
+    print(f"    W: {layer['W'].shape},  std={layer['W'].std():.4f}  "
+          f"(expected ≈{(2/512)**0.5:.4f})")
+    print(f"    b: {layer['b'].shape},  all zeros ✓")
+
+
+# §5  ASSIGNMENT — Pure-JAX MLP (no Flax, no Optax)
+
+
+def section_assignment():
+    """
+    Train a 2-layer MLP on XOR using ONLY raw JAX primitives.
+    Goal: learn the XOR function (label 1 iff exactly one input is 1).
+
+    Architecture: Linear(2→32) → Tanh → Linear(32→1) → Sigmoid
+    Loss        : Binary cross-entropy
+    Optimiser   : Vanilla SGD (manual parameter update)
+    """
+    print("\n" + "─" * 60)
+    print("§5  Assignment — Pure-JAX MLP on XOR (no Flax, no Optax)")
+    print("─" * 60)
+
+    # Dataset
+    X = jnp.array([[0., 0.],
+                   [0., 1.],
+                   [1., 0.],
+                   [1., 1]])
+    
+    Y = jnp.array([[0.], [1.], [1.], [0.]])   # XOR labels
+
+    # Parameter initialisation
+    def init_params(key, hidden=32):
+        k1, k2 = jax.random.split(key)
+        return {
+            "W1": jax.random.normal(k1, (2, hidden)) * 0.5,
+            "b1": jnp.zeros(hidden),
+            "W2": jax.random.normal(k2, (hidden, 1)) * 0.5,
+            "b2": jnp.zeros(1),
+        }
+    
+    # Forward pass
+    def forward(p, x):
+        h = jnp.tanh(x @ p["W1"] + p["b1"])       # hidden layer
+        return jax.nn.sigmoid(h @ p["W2"] + p["b2"]) # output
+    
+    
+    
+    # Loss: Binary cross-entropy
+    def bce_loss(p, x, y):
+        pred = forward(p, X)
+        eps = 1e-7
+        return -jnp.mean(y * jnp.log(pred + eps) + (1 - y) * jnp.log(1 - pred + eps))
+    
+    # Compile the value+grad function once
+    loss_and_grad = jax.jit(jax.value_and_grad(bce_loss)) 
+    
+    # ── Training loop ─────────────────────────────────────────────────────
+    params = init_params(jax.random.PRNGKey(7))
+    lr     = 1.0
+    N      = 3_000
+
+    print("\n Check shapes before training...")
+    print("X shape:", X.shape)
+    print("Y shape:", Y.shape)
+    print("W1 shape:", params["W1"].shape)
+    print("b1 shape:", params["b1"].shape)
+    print("W2 shape:", params["W2"].shape)
+    print("b2 shape:", params["b2"].shape)
+
+   
+    print(f"\n  Training {N} steps, lr={lr} ...")
+    for step in range(N+1):
+        loss, grads = loss_and_grad(params, X, Y)
+        # Manual SGD: θ ← θ - lr·∇θ
+        params = jax.tree.map(lambda p, g:p - lr * g, params, grads)
+
+        if step % 10 == 0:
+            pred = forward(params, X)
+            acc = jnp.mean((pred > 0.5) == Y)
+            print(f"   step {step:4d}  | Loss={float(loss):.4f}  |  acc={float(acc):.2f}")
+
+    print("\n  Final predictions:")
+    print(f"  {'Input':12s}  {'Pred':>6s}  {'Label':>6s}  {'Correct':>7s}")
+    for xi, yi, pi in zip(X, Y, forward(params, X)):
+        correct = "✓" if (float(pi[0]) > 0.5) == bool(yi[0]) else "✗"
+        print(f"  {str(xi.tolist()):12s}  {float(pi[0]):6.3f}  {int(yi[0]):6d}  {correct:>7s}")
+
+
+# ──────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    print("╔══════════════════════════════════════════════════════════════╗")
+    print("║  Module 1 — JAX Core Primitives                             ║")
+    print("╚══════════════════════════════════════════════════════════════╝\n")
+
+    section_autodiff()
+    section_jit()
+    section_vmap()
+    section_random()
+    section_assignment()
+
+
+
+
+    
+
+
+
+
 
 
 

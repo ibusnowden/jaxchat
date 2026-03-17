@@ -1,0 +1,18 @@
+# checkpoints
+checkpoints/
+
+# slurm logs
+*.err
+*.out
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# data
+data/
+
+# uv
+uv.lock

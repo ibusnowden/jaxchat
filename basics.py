@@ -342,9 +342,8 @@ def section_assignment():
 
 # ──────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    print("╔══════════════════════════════════════════════════════════════╗")
-    print("║  Module 1 — JAX Core Primitives                             ║")
-    print("╚══════════════════════════════════════════════════════════════╝\n")
+    print("JAX Core Primitives")
+   
 
     section_autodiff()
     section_jit()

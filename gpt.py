@@ -1,1 +1,0 @@
-# MiniGPT model + tests

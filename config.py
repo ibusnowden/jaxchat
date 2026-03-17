@@ -2,46 +2,34 @@
 from dataclasses import dataclass
 
 """
-config.py — MiniGPT Course: Central Configuration
-===================================================
 All model, training, and generation hyperparameters live here.
-Edit values once; they propagate to every other module.
+python config.py
 """
 
 # MODEL
 @dataclass
 class ModelConfig:
     """
-    Default values produce ~20 M parameters (weight-tied):
+    TinyStories default:
+      vocab_size=100,280
+      max_seq_len=256
+      d_model=704
+      n_heads=11
+      n_layers=9
+      d_ff=2816
 
-    Component                   Parameters
-    ──────────────────────────────────────
-    Token embedding (8192×512)   4,194,304
-    Pos  embedding  (256 ×512)     131,072
-    Per TransformerBlock:
-      QKV proj  (512→1536)         786,432
-      Out proj  (512→512)          262,144
-      FFN fc1   (512→2048)       1,048,576
-      FFN fc2   (2048→512)       1,048,576
-      LayerNorms (×2, scale+bias)    2,048
-      Subtotal                   3,147,776
-    × 5 blocks                  15,738,880
-    Final LayerNorm                  1,024
-    LM head            (tied →  0 extra)
-    ──────────────────────────────────────
-    TOTAL                       20,065,280 
-
-    TP = (V x d_model) x n_layer x (12 x d^2_model)
+    With tied embeddings this lands at ~124.3M parameters by the
+    analytic estimate and ~124.4M parameters in the instantiated model.
     """
     # Vocabulary  and context
-    vocab_size:   int = 8_192     # characters ≈ 65 for char-level; 8192 for small BPE
+    vocab_size:   int = 100_280   # TinyStories tokenizer vocab: cl100k_base + BOS/EOS/PAD
     max_seq_len:  int = 256       # context window (tokens)
 
     # Width / depth
-    d_model:      int = 512     # embedding and hidden dimension
-    n_heads:      int = 8        # attention heads (d_model % n_heads == 0)
-    n_layers:     int = 8        # transformer blocks stacked
-    d_ff:         int = 2048      # FFN inner dim (=4 x d_model)
+    d_model:      int = 704       # embedding and hidden dimension
+    n_heads:      int = 11        # 704 / 11 = 64-dim heads
+    n_layers:     int = 9         # transformer blocks stacked
+    d_ff:         int = 2816      # FFN inner dim (=4 x d_model)
 
     # Regularisation
     dropout:      float = 0.1
@@ -71,29 +59,30 @@ class ModelConfig:
 class TrainConfig:
     # path
     data_dir:       str = "./data"
-    checkpoint_dir: str = "./checkpoints"
+    checkpoint_dir: str = "./checkpoints/124m-tinystories"
 
     # batching
-    batch_size:     int = 32
+    batch_size:     int = 8
     seq_len:        int = 256       # must match ModelConfig.max_seq_len
 
     # optimizer adam -> muon later
-    learning_rate:  float = 3e-4
+    learning_rate:  float = 2e-4
     weight_decay:   float = 0.1
     beta1:          float = 0.9
-    beat2:          float = 0.95
+    beta2:          float = 0.95
     grad_clip:      float = 1.0
 
     # lr schedule
-    warmup_step:    int = 500
-    total_steps:    int = 10_000
-    min_lr:         float = 3e-5     # cosine decay floor
+    warmup_step:    int = 1_000
+    total_steps:    int = 50_000
+    min_lr:         float = 2e-5     # cosine decay floor
 
     # logging/ checkpointing
     log_every:      int = 50
-    eval_every:     int = 500     # validation batches to average over
+    eval_every:     int = 500     # run validation every N steps
+    eval_iters:     int = 20      # number of validation batches to average over
     save_every:     int = 1_000
-    keep_checkpointing: int = 3 
+    keep_checkpointing: int = 5
 
     # repro
     seed:           int = 42
@@ -118,5 +107,4 @@ DEFAULT_GEN = GenerationConfig()
 if __name__ == "__main__":
     cfg = ModelConfig()
     print(f"ModelConfig -> approx {cfg.approx_params:,} params (~{cfg.approx_params/1e6:.1f} M)")
-
 

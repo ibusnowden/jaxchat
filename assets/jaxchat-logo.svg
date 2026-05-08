@@ -27,6 +27,9 @@
 <rect x="44" y="174" width="26" height="26" fill="#5B8DEF" stroke="#0c0d12" stroke-width="1"/>
 <polygon points="44,174 70,174 79,165 53,165" fill="#6facff" stroke="#0c0d12" stroke-width="1"/>
 <polygon points="70,174 79,165 79,191 70,200" fill="#324d83" stroke="#0c0d12" stroke-width="1"/>
+<rect x="70" y="174" width="26" height="26" fill="#5B8DEF" stroke="#0c0d12" stroke-width="1"/>
+<polygon points="70,174 96,174 105,165 79,165" fill="#6facff" stroke="#0c0d12" stroke-width="1"/>
+<polygon points="96,174 105,165 105,191 96,200" fill="#324d83" stroke="#0c0d12" stroke-width="1"/>
 <rect x="96" y="174" width="26" height="26" fill="#5B8DEF" stroke="#0c0d12" stroke-width="1"/>
 <polygon points="96,174 122,174 131,165 105,165" fill="#6facff" stroke="#0c0d12" stroke-width="1"/>
 <polygon points="122,174 131,165 131,191 122,200" fill="#324d83" stroke="#0c0d12" stroke-width="1"/>
@@ -39,9 +42,6 @@
 <rect x="70" y="200" width="26" height="26" fill="#5B8DEF" stroke="#0c0d12" stroke-width="1"/>
 <polygon points="70,200 96,200 105,191 79,191" fill="#6facff" stroke="#0c0d12" stroke-width="1"/>
 <polygon points="96,200 105,191 105,217 96,226" fill="#324d83" stroke="#0c0d12" stroke-width="1"/>
-<rect x="96" y="200" width="26" height="26" fill="#5B8DEF" stroke="#0c0d12" stroke-width="1"/>
-<polygon points="96,200 122,200 131,191 105,191" fill="#6facff" stroke="#0c0d12" stroke-width="1"/>
-<polygon points="122,200 131,191 131,217 122,226" fill="#324d83" stroke="#0c0d12" stroke-width="1"/>
 <rect x="226" y="44" width="26" height="26" fill="#26C2A8" stroke="#0c0d12" stroke-width="1"/>
 <polygon points="226,44 252,44 261,35 235,35" fill="#2eeccc" stroke="#0c0d12" stroke-width="1"/>
 <polygon points="252,44 261,35 261,61 252,70" fill="#146a5c" stroke="#0c0d12" stroke-width="1"/>

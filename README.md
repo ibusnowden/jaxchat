@@ -41,7 +41,6 @@ tests/        pytest suite (engine smoke, sft masking, training stack, ckpt)
 ```
 
 `ablation_notes.md` tracks ideas under consideration and ones already ruled out.
-`scaling.md` lists the width/depth/FFN/heads targets for 30M / 124M / 0.5B / 1B.
 
 ## Replication
 

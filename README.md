@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/jaxchat-logo.svg" alt="jaxchat" width="640">
+</p>
+
 # jaxchat
 
 A from-scratch JAX implementation of a small GPT-style chatbot, trained end-to-end:
@@ -24,7 +28,15 @@ under `data/d4_speedrun/`.
 | 9 | Final chat eval | `scripts.chat_eval` | with GSM8K (n=100) |
 
 Loss curves and eval metrics are logged to Weights & Biases under the project
-`jaxchat`.
+`jaxchat`. Sample run from a `d4` (~11.5M-param) base pretrain over ~27.7k steps
+on a single H100:
+
+<p align="center">
+  <img src="assets/loss.png" alt="training loss" width="48%">
+  <img src="assets/val_bpb.png" alt="validation bits per byte" width="48%">
+</p>
+
+Training loss drops from ~7.0 to ~3.8; validation BPB from ~2.3 to ~1.4.
 
 ## Layout
 

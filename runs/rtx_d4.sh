@@ -3,9 +3,9 @@
 #SBATCH --partition=bigTiger
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --gres=gpu:rtx_6000:8
-#SBATCH --cpus-per-task=32
-#SBATCH --mem=256G
+#SBATCH --gres=gpu:rtx_6000:1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=64G
 #SBATCH --output=/project/inniang/jaxchat/slurm-%A.out
 #SBATCH --error=/project/inniang/jaxchat/slurm-%A.err
 #SBATCH --export=ALL

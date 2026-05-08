@@ -1,0 +1,446 @@
+"""Active JAX training orchestration for the depth-driven base model stack."""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import datetime
+import glob
+import os
+import sys
+import time
+from typing import Callable
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+if __package__ in {None, ""}:
+    if PROJECT_ROOT not in sys.path:
+        sys.path.insert(0, PROJECT_ROOT)
+
+import jaxchat.model as model_lib
+
+model_lib.configure_jax_runtime()
+
+import jax
+import jax.numpy as jnp
+from jax import jit
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+from jax.tree_util import tree_map
+
+from jaxchat import checkpoint as ckpt_lib
+from jaxchat import wandb_log as wb
+from jaxchat.fa3 import backend_summary_for_config
+from jaxchat.model import (
+    Config,
+    Logger,
+    Pytree,
+    count_parameters,
+    estimate_mfu_proxy,
+    eval_step,
+    expected_parameter_breakdown,
+    format_parameter_breakdown,
+    format_shape_summary,
+    get_data_parallel_sharding,
+    get_eval_shape,
+    get_mesh,
+    get_train_shape_counts,
+    init_optimizer,
+    init_params,
+    load_dataset,
+    parameter_breakdown_from_params,
+    precompute_token_bytes,
+    train_step,
+)
+
+
+def _hours_for_throughput(total_tokens: int, tok_s: float) -> float:
+    return float(total_tokens) / max(tok_s, 1.0) / 3600.0
+
+
+def run_evaluation(
+    step: int,
+    config: Config,
+    params: Pytree,
+    val_loader,
+    precomputed_params: Pytree,
+    token_bytes: jax.Array,
+    logger: Logger,
+    compiled_eval_fn: Callable,
+):
+    eval_start = time.perf_counter()
+    logger.msg(f"Running validation for step {step}...")
+    val_loader.reset()
+    bpb_accum = 0.0
+    val_steps = 0
+    for batched_x, batched_y in val_loader:
+        bpb = compiled_eval_fn(
+            params,
+            batched_x,
+            batched_y,
+            precomputed_params,
+            token_bytes,
+        )
+        bpb_accum += float(bpb)
+        val_steps += 1
+    if val_steps == 0:
+        logger.msg("Validation loader was empty, no validation was run.")
+        return time.perf_counter() - eval_start
+    final_bpb = bpb_accum / val_steps
+    logger.log({"step": step, "val_bpb": final_bpb})
+    wb.wandb_log({"step": step, "val_bpb": final_bpb})
+    logger.msg(f"Validation finished for step {step}. BPB: {final_bpb:.4f}")
+    return time.perf_counter() - eval_start
+
+
+def validate_training_assets(config: Config) -> None:
+    missing = []
+    if not glob.glob(config.input_bin):
+        missing.append(f"Training shard glob matched no files: {config.input_bin}")
+    if not glob.glob(config.input_val_bin):
+        missing.append(f"Validation shard glob matched no files: {config.input_val_bin}")
+    if missing:
+        details = "\n".join(f"- {item}" for item in missing)
+        raise FileNotFoundError(f"Missing training assets:\n{details}")
+
+
+def train_loop(
+    config: Config,
+    *,
+    preset_name: str = "default",
+    run_dir: str | None = None,
+    resume: bool = False,
+    smoke_iters: int | None = None,
+):
+    wall_start = time.perf_counter()
+    validate_training_assets(config)
+    logger = Logger(run_dir=run_dir)
+    if config.tokenizer_json and not os.path.exists(config.tokenizer_json):
+        logger.msg(
+            f"Tokenizer JSON not found at {config.tokenizer_json}; "
+            "falling back to approximate token-byte accounting."
+        )
+    mesh = get_mesh(config)
+
+    if smoke_iters is not None and smoke_iters > 0:
+        config = dataclasses.replace(
+            config,
+            n_train_iters=int(smoke_iters),
+            n_warmup_iters=min(config.n_warmup_iters, max(int(smoke_iters) // 8, 1)),
+            target_train_tokens=int(smoke_iters) * config.tokens_per_step,
+        )
+        logger.msg(f"Smoke override: n_train_iters={config.n_train_iters}")
+
+    if logger.is_master:
+        wb.wandb_init(
+            stage="base",
+            run_name=f"base-{preset_name}-{logger.run_id}",
+            config_dict=wb.config_from_dataclass(config, {"preset": preset_name}),
+        )
+
+    resumed_state: dict | None = None
+    start_step = 0
+    if resume and logger.logdir is not None:
+        try:
+            resumed_state = ckpt_lib.load_latest(logger.logdir, stage="base")
+        except FileNotFoundError:
+            logger.msg("Resume requested but no base checkpoint found; starting from scratch.")
+            resumed_state = None
+
+    with mesh:
+        logger.msg(f"Attention runtime: {backend_summary_for_config(config, mesh=mesh)}")
+        params, precomputed_params = init_params(config, mesh)
+        if resumed_state is not None:
+            weight_sharding = model_lib.get_weight_sharding(config, mesh)
+            params = tree_map(
+                lambda leaf: jax.device_put(jnp.asarray(leaf), weight_sharding),
+                resumed_state["params"],
+            )
+            start_step = int(resumed_state["step"]) + 1
+            logger.msg(
+                f"Resumed from step {resumed_state['step']} "
+                f"({resumed_state.get('_checkpoint_path', '<unknown>')})"
+            )
+        expected_breakdown = expected_parameter_breakdown(config)
+        actual_breakdown = parameter_breakdown_from_params(params)
+        if actual_breakdown != expected_breakdown:
+            raise RuntimeError(
+                "Parameter breakdown mismatch.\n"
+                f"expected={expected_breakdown}\nactual={actual_breakdown}"
+            )
+
+        token_bytes = precompute_token_bytes(config, mesh)
+        optimizer, opt_state = init_optimizer(config, params, mesh)
+        if resumed_state is not None and resumed_state.get("opt_state") is not None:
+            opt_state = tree_map(jnp.asarray, resumed_state["opt_state"])
+            logger.msg("Restored optimizer state from checkpoint.")
+        param_count = count_parameters(params)
+        train_shape_counts = get_train_shape_counts(config)
+        val_shape = get_eval_shape(config)
+
+        logger.msg(
+            f"Preset: {preset_name} | depth: {config.depth} | params: {param_count:,} | "
+            f"tokens_per_step: {config.tokens_per_step:,}"
+        )
+        logger.msg(f"Param breakdown: {format_parameter_breakdown(actual_breakdown)}")
+        logger.msg(
+            f"Target train tokens: {config.target_train_tokens:,} | "
+            f"Scheduled train tokens: {config.actual_train_tokens:,} | "
+            f"steps: {config.n_train_iters:,}"
+        )
+        logger.msg(
+            "ETA range at 160k-240k tok/s: "
+            f"{_hours_for_throughput(config.actual_train_tokens, 240_000):.2f}h - "
+            f"{_hours_for_throughput(config.actual_train_tokens, 160_000):.2f}h"
+        )
+        logger.msg(f"Training shapes: {format_shape_summary(train_shape_counts)}")
+        logger.msg(
+            f"Validation shape: (seq_len={val_shape[0]}, batch={val_shape[1]}, "
+            f"grad_accum={val_shape[2]}) | val_tokens: {config.val_tokens:,}"
+        )
+
+        embedding_out_sharding = get_data_parallel_sharding(config, mesh, ndim=3)
+        token_bytes_out_sharding = get_data_parallel_sharding(config, mesh, ndim=1)
+        jitted_train_step = jit(
+            train_step,
+            static_argnames=("config", "optimizer", "embedding_out_sharding"),
+            donate_argnums=(1, 3),
+        )
+        jitted_eval_step = jit(
+            eval_step,
+            static_argnames=("config", "embedding_out_sharding", "token_bytes_out_sharding"),
+        )
+
+        logger.msg("Determining all unique training shapes...")
+        train_shapes = set(train_shape_counts)
+        train_shapes.add(val_shape)
+        logger.msg("Starting Ahead-of-Time (AOT) compilation for all shapes...")
+        compiled_train_steps = {}
+        compiled_eval_fn = None
+        activation_sharding = NamedSharding(mesh, P(*config.activation_sharding))
+        compile_start = time.perf_counter()
+        for seq_len, batch_size, n_grad_accum_steps in sorted(list(train_shapes)):
+            shape_key = (seq_len, batch_size, n_grad_accum_steps)
+            logger.msg(
+                f"AOT compiling for seq_len={seq_len}, B={batch_size}, grad_accum={n_grad_accum_steps}..."
+            )
+            dummy_x_shape = (n_grad_accum_steps, config.micro_batch_size, seq_len)
+            dummy_x = jnp.zeros(dummy_x_shape, dtype=jnp.int32)
+            dummy_y = jnp.zeros_like(dummy_x)
+            dummy_x = jax.device_put(dummy_x, activation_sharding)
+            dummy_y = jax.device_put(dummy_y, activation_sharding)
+            compiled_fn = jitted_train_step.lower(
+                config,
+                params,
+                precomputed_params,
+                opt_state,
+                optimizer,
+                embedding_out_sharding,
+                dummy_x,
+                dummy_y,
+            ).compile()
+            compiled_train_steps[shape_key] = compiled_fn
+            if shape_key == val_shape:
+                compiled_eval_fn = jitted_eval_step.lower(
+                    params,
+                    dummy_x,
+                    dummy_y,
+                    precomputed_params,
+                    token_bytes,
+                    config,
+                    embedding_out_sharding,
+                    token_bytes_out_sharding,
+                ).compile()
+        compile_s = time.perf_counter() - compile_start
+        logger.msg("AOT compilation finished for all function variants.")
+        logger.msg(f"compile_s: {compile_s:.3f}")
+
+        data_open_start = time.perf_counter()
+        train_loader = load_dataset(config, logger, mesh, is_training=True)
+        val_loader = load_dataset(config, logger, mesh, is_training=False)
+        data_open_s = time.perf_counter() - data_open_start
+        logger.msg(f"data_open_s: {data_open_s:.3f}")
+
+        eval_s_total = 0.0
+        checkpoint_s_in_loop = 0.0
+        logger.msg("Starting training...")
+        train_loop_start = time.perf_counter()
+
+        def _save_base(step_idx: int) -> str:
+            return ckpt_lib.save(
+                stage="base",
+                step=step_idx,
+                params=params,
+                opt_state=opt_state,
+                config=config,
+                run_dir=logger.logdir or run_dir or ".",
+                tokenizer_path=config.tokenizer_json,
+                rng_seed=config.seed,
+            )
+
+        for step in range(start_step, config.n_train_iters):
+            batched_x, batched_y = next(train_loader)
+            n_grad_accum, _, seq_len = batched_x.shape
+            batch_size = n_grad_accum * config.micro_batch_size
+            current_shape_key = (seq_len, batch_size, n_grad_accum)
+            aot_train_fn = compiled_train_steps[current_shape_key]
+            params, opt_state, metrics = aot_train_fn(
+                params,
+                precomputed_params,
+                opt_state,
+                batched_x,
+                batched_y,
+            )
+
+            if step % 10 == 9:
+                metrics_view = {k: float(v) for k, v in metrics.items()}
+                logger.log({"step": step, "time": datetime.datetime.now()} | metrics_view)
+                wb.wandb_log({"step": step, **metrics_view})
+            if step > 0 and step % config.val_loss_every == 0:
+                eval_s_total += run_evaluation(
+                    step,
+                    config,
+                    params,
+                    val_loader,
+                    precomputed_params,
+                    token_bytes,
+                    logger,
+                    compiled_eval_fn,
+                )
+                logger.flush()
+            if (
+                config.save_every > 0
+                and step > 0
+                and step % config.save_every == 0
+                and step < config.n_train_iters - 1
+            ):
+                checkpoint_start = time.perf_counter()
+                save_path = _save_base(step)
+                logger.msg(f"Saved checkpoint to {save_path}")
+                checkpoint_s_in_loop += time.perf_counter() - checkpoint_start
+
+        jax.block_until_ready(params)
+        train_loop_s = time.perf_counter() - train_loop_start
+        final_checkpoint_start = time.perf_counter()
+        final_path = _save_base(config.n_train_iters - 1)
+        logger.msg(f"Saved final checkpoint to {final_path}")
+        final_checkpoint_s = time.perf_counter() - final_checkpoint_start
+        checkpoint_s_total = checkpoint_s_in_loop + final_checkpoint_s
+        total_wall_s = time.perf_counter() - wall_start
+        effective_train_s = max(train_loop_s - eval_s_total - checkpoint_s_in_loop, 0.0)
+        steady_state_step_s = effective_train_s / max(config.n_train_iters, 1)
+        aggregate_tok_s = (
+            config.actual_train_tokens / effective_train_s if effective_train_s > 0 else 0.0
+        )
+        mfu_proxy = estimate_mfu_proxy(param_count, config, steady_state_step_s)
+        timing_metrics = {
+            "compile_s": compile_s,
+            "data_open_s": data_open_s,
+            "train_loop_s": train_loop_s,
+            "eval_s_total": eval_s_total,
+            "checkpoint_s": checkpoint_s_total,
+            "total_wall_s": total_wall_s,
+            "steady_state_step_s": steady_state_step_s,
+            "aggregate_tok_s": aggregate_tok_s,
+            "mfu_proxy": mfu_proxy,
+        }
+
+        logger.msg("Training finished.")
+        logger.log(timing_metrics)
+        wb.wandb_log(timing_metrics)
+        wb.wandb_finish()
+        logger.msg(
+            "Timing summary | "
+            f"compile_s: {compile_s:.3f} | "
+            f"data_open_s: {data_open_s:.3f} | "
+            f"train_loop_s: {train_loop_s:.3f} | "
+            f"eval_s_total: {eval_s_total:.3f} | "
+            f"checkpoint_s: {checkpoint_s_total:.3f} | "
+            f"total_wall_s: {total_wall_s:.3f} | "
+            f"steady_state_step_s: {steady_state_step_s:.6f} | "
+            f"aggregate_tok_s: {aggregate_tok_s:.1f} | "
+            f"mfu_proxy: {mfu_proxy:.4f}"
+        )
+        logger.flush()
+
+
+from jaxchat.presets import (
+    DEFAULT_CONFIG,
+    FINEWEB_32K_DIR,
+    FINEWEB_TOKENIZER_JSON,
+    FINEWEB_TRAIN_GLOB,
+    FINEWEB_VAL_BIN,
+    PRESET_1P384B_DEPTH24,
+    PRESETS,
+    SMOKE,
+)
+
+
+def build_config(args) -> tuple[Config, str]:
+    config = PRESETS[args.preset]
+    preset_name = args.preset
+    replace_kwargs = {}
+    if args.depth is not None:
+        replace_kwargs["depth"] = args.depth
+        preset_name = f"depth{args.depth}"
+    if args.input_bin:
+        replace_kwargs["input_bin"] = args.input_bin
+    if args.input_val_bin:
+        replace_kwargs["input_val_bin"] = args.input_val_bin
+    if args.tokenizer_json is not None:
+        replace_kwargs["tokenizer_json"] = args.tokenizer_json
+    if replace_kwargs:
+        config = dataclasses.replace(config, **replace_kwargs)
+    return config, preset_name
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Train the JAX depth-driven base model")
+    parser.add_argument(
+        "--preset",
+        choices=tuple(PRESETS),
+        default="default",
+        help="Training preset to run.",
+    )
+    parser.add_argument(
+        "--depth",
+        type=int,
+        default=None,
+        help="Depth override. d_model derives as depth*64 and n_heads as d_model/128.",
+    )
+    parser.add_argument("--input-bin", default="", help="Override training shard glob.")
+    parser.add_argument("--input-val-bin", default="", help="Override validation shard glob.")
+    parser.add_argument(
+        "--tokenizer-json",
+        default=None,
+        help="Override tokenizer JSON used for token-byte accounting.",
+    )
+    parser.add_argument(
+        "--run-dir",
+        default=None,
+        help="Explicit output directory for train.log and checkpoints.",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="If --run-dir already has a base checkpoint, resume from it.",
+    )
+    parser.add_argument(
+        "--smoke-iters",
+        type=int,
+        default=None,
+        help="Override n_train_iters for a quick wiring test.",
+    )
+    args = parser.parse_args(argv)
+    config, preset_name = build_config(args)
+    train_loop(
+        config,
+        preset_name=preset_name,
+        run_dir=args.run_dir,
+        resume=args.resume,
+        smoke_iters=args.smoke_iters,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

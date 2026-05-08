@@ -5,6 +5,10 @@ checkpoints/
 *.err
 *.out
 
+# wandb + local logs
+wandb/
+logs/
+
 # python
 __pycache__/
 *.pyc

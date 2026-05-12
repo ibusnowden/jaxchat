@@ -79,7 +79,11 @@ $PY -m scripts.base_eval --run-dir "$BASE_RUN" --core-n 200 || echo "(base_eval 
 echo "=========================================="
 echo "Stage 5/9: prepare SFT data"
 echo "=========================================="
-$PY -m dev.synth_smoltalk --out "$SFT_DATA" --n 5000
+if [ -f "$SFT_DATA" ] && [ "$(wc -l < "$SFT_DATA")" -ge 1000 ]; then
+  echo "[skip] SFT data already at $SFT_DATA ($(wc -l < "$SFT_DATA") rows)"
+else
+  $PY -m dev.synth_smoltalk --out "$SFT_DATA" --n 5000
+fi
 
 echo "=========================================="
 echo "Stage 6/9: supervised fine-tuning"

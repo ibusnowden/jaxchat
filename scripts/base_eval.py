@@ -25,10 +25,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--run-dir", required=True)
     parser.add_argument("--core-n", type=int, default=200, help="Examples per CORE task.")
     parser.add_argument("--skip-core", action="store_true", help="Only compute val_bpb and skip CORE.")
+    parser.add_argument("--skip-generation", action="store_true",
+                        help="Skip the slow autoregressive sample generation in the BPB report.")
     parser.add_argument("--tokenizer-json", default=None)
     args = parser.parse_args(argv)
 
-    bpb_report = evaluate_run(args.run_dir)
+    bpb_report = evaluate_run(args.run_dir, generate_samples=not args.skip_generation)
     output: dict = dict(bpb_report)
 
     if not args.skip_core:

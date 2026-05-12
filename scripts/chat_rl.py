@@ -59,7 +59,7 @@ from jaxchat.tokenizer import load_hf_tokenizer  # noqa: E402
 from tasks import gsm8k  # noqa: E402
 
 
-def rl_loss_fn(params, ref_params, batch, precomputed_params, config, embedding_out_sharding, kl_beta):
+def rl_loss_fn(params, ref_params, batch, precomputed_params, config, embedding_out_sharding, kl_beta, clip_eps):
     idx, labels, mask, adv = batch
     logits = gpt_forward(params, idx, precomputed_params, config, embedding_out_sharding)
     logp_full = jax.nn.log_softmax(logits, axis=-1)
@@ -72,12 +72,16 @@ def rl_loss_fn(params, ref_params, batch, precomputed_params, config, embedding_
     mask_f = mask.astype(jnp.float32)
     denom = jnp.maximum(jnp.sum(mask_f), 1.0)
     advantages = adv[:, None].astype(jnp.float32)
-    pg = -(advantages * logp_token * mask_f).sum() / denom
+
+    # Importance ratio with clipping (standard PPO/GRPO).
+    ratio = jnp.exp(logp_token - ref_logp_token)
+    clipped_ratio = jnp.clip(ratio, 1.0 - clip_eps, 1.0 + clip_eps)
+    pg = -(jnp.minimum(advantages * ratio, advantages * clipped_ratio) * mask_f).sum() / denom
     kl = ((logp_token - ref_logp_token) * mask_f).sum() / denom
-    return pg + kl_beta * kl, {"pg": pg, "kl": kl}
+    return pg + kl_beta * kl, {"pg": pg, "kl": kl, "approx_kl": float(kl), "ratio_mean": float(jnp.mean(ratio))}
 
 
-@partial(jit, static_argnames=("optimizer", "config", "embedding_out_sharding", "kl_beta"))
+@partial(jit, static_argnames=("optimizer", "config", "embedding_out_sharding", "kl_beta", "clip_eps"))
 def rl_train_step(
     config,
     params,
@@ -91,9 +95,10 @@ def rl_train_step(
     mask,
     adv,
     kl_beta,
+    clip_eps,
 ):
     (loss, aux), grads = value_and_grad(rl_loss_fn, has_aux=True)(
-        params, ref_params, (idx, labels, mask, adv), precomputed_params, config, embedding_out_sharding, kl_beta,
+        params, ref_params, (idx, labels, mask, adv), precomputed_params, config, embedding_out_sharding, kl_beta, clip_eps,
     )
     new_params, new_opt_state = optimizer.update(grads, params, opt_state)
     return new_params, new_opt_state, {"loss": loss, **aux}
@@ -152,8 +157,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-k", type=int, default=50)
     parser.add_argument("--top-p", type=float, default=1.0)
-    parser.add_argument("--lr-scale", type=float, default=0.05)
-    parser.add_argument("--kl-beta", type=float, default=0.02)
+    parser.add_argument("--lr-scale", type=float, default=0.02)
+    parser.add_argument("--kl-beta", type=float, default=0.01)
+    parser.add_argument("--clip-eps", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--save-every", type=int, default=25)
     parser.add_argument("--smoke-iters", type=int, default=None)
@@ -204,6 +210,7 @@ def main(argv: list[str] | None = None) -> int:
                     "m_prompts": args.m_prompts,
                     "g_rollouts": args.g_rollouts,
                     "kl_beta": args.kl_beta,
+                    "clip_eps": args.clip_eps,
                     "lr_scale": args.lr_scale,
                     "parent": parent_meta,
                 },
@@ -313,6 +320,7 @@ def main(argv: list[str] | None = None) -> int:
                 mask_d,
                 adv_d,
                 args.kl_beta,
+                args.clip_eps,
             )
 
             engine.params = params  # refresh sampler.

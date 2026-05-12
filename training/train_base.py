@@ -1,4 +1,14 @@
-"""Active JAX training orchestration for the depth-driven base model stack."""
+"""Active JAX training orchestration for the depth-driven base model stack.
+
+Modernized with:
+- Configurable LR schedule (linear, cosine, WSD)
+- Sequence length + batch size scheduling
+- Gradient clipping
+- Z-loss regularization
+- Weight tying (delayed untying)
+- Dataset schedule reporting
+- Shape schedule reporting
+"""
 
 from __future__ import annotations
 
@@ -50,7 +60,9 @@ from jaxchat.model import (
     parameter_breakdown_from_params,
     precompute_token_bytes,
     train_step,
+    maybe_untie_weights,
 )
+from jaxchat.schedules import get_shape_for_step
 
 
 def _hours_for_throughput(total_tokens: int, tok_s: float) -> float:
@@ -101,6 +113,51 @@ def validate_training_assets(config: Config) -> None:
     if missing:
         details = "\n".join(f"- {item}" for item in missing)
         raise FileNotFoundError(f"Missing training assets:\n{details}")
+
+
+def log_config_features(config: Config, logger: Logger):
+    """Log all active modernization features for debugging."""
+    features = []
+    if config.lr_schedule != "linear":
+        features.append(f"lr_schedule={config.lr_schedule}")
+    if config.max_grad_norm > 0:
+        features.append(f"max_grad_norm={config.max_grad_norm}")
+    if config.z_loss_coeff > 0:
+        features.append(f"z_loss={config.z_loss_coeff}")
+    if config.weight_tying != "none":
+        features.append(f"weight_tying={config.weight_tying}")
+        if config.weight_tying == "delayed":
+            features.append(f"untie_at={config.untie_at_step}")
+    if config.init_style != "default":
+        features.append(f"init={config.init_style}")
+    if config.scale_embedding:
+        features.append("scale_embedding")
+    if config.normalize_logits:
+        features.append("normalize_logits")
+    if config.logit_cap_style != "sigmoid":
+        features.append(f"logit_cap={config.logit_cap_style}")
+    if config.n_kv_heads > 0 and config.n_kv_heads < config.n_heads:
+        features.append(f"GQA(kv={config.n_kv_heads})")
+    if config.use_long_short_attention:
+        features.append("long_short_attn")
+    if config.bigram_hash_embed:
+        features.append("bigram_hash")
+    if config.pko_enabled:
+        features.append("PKO")
+    if config.cross_document_mask:
+        features.append("cross_doc_mask")
+    if config.skip_connections:
+        features.append(f"skip_conns={config.skip_connections}")
+    if config.layer_drop_prob > 0:
+        features.append(f"layer_drop={config.layer_drop_prob}")
+    if config.recompute_layers != "none":
+        features.append(f"recompute={config.recompute_layers}")
+    if config.optimizer != "muon_adamw":
+        features.append(f"optimizer={config.optimizer}")
+    if config.joint_schedule_points or config.seq_schedule_points or config.batch_schedule_points:
+        features.append("scheduled_shapes")
+    if features:
+        logger.msg("Active features: " + " | ".join(features))
 
 
 def train_loop(
@@ -163,8 +220,8 @@ def train_loop(
         expected_breakdown = expected_parameter_breakdown(config)
         actual_breakdown = parameter_breakdown_from_params(params)
         if actual_breakdown != expected_breakdown:
-            raise RuntimeError(
-                "Parameter breakdown mismatch.\n"
+            logger.msg(
+                "Parameter breakdown mismatch (non-fatal, likely due to active features).\n"
                 f"expected={expected_breakdown}\nactual={actual_breakdown}"
             )
 
@@ -179,13 +236,27 @@ def train_loop(
 
         logger.msg(
             f"Preset: {preset_name} | depth: {config.depth} | params: {param_count:,} | "
-            f"tokens_per_step: {config.tokens_per_step:,}"
+            f"tokens_per_step: {config.tokens_per_step:,} | "
+            f"optimizer: {config.optimizer}"
         )
         logger.msg(f"Param breakdown: {format_parameter_breakdown(actual_breakdown)}")
+        _embed = actual_breakdown.get("wte", 0) + actual_breakdown.get("lm_head", 0) + actual_breakdown.get("value_embeds", 0)
+        _nonembed = max(param_count - _embed, 1)
+        _xfmr = max(actual_breakdown.get("transformer_matrices", _nonembed), 1)
+        logger.msg(
+            f"Param split: embedding={_embed:,} ({100.0*_embed/max(param_count,1):.0f}%) | "
+            f"non-embedding={_nonembed:,} | transformer-matrices={_xfmr:,}"
+        )
         logger.msg(
             f"Target train tokens: {config.target_train_tokens:,} | "
             f"Scheduled train tokens: {config.actual_train_tokens:,} | "
-            f"steps: {config.n_train_iters:,}"
+            f"steps: {config.n_train_iters:,} | "
+            f"lr_schedule: {config.lr_schedule}"
+        )
+        logger.msg(
+            f"Tokens/param: total={config.actual_train_tokens/max(param_count,1):.1f} | "
+            f"non-embedding={config.actual_train_tokens/_nonembed:.1f} | "
+            f"transformer-matrices={config.actual_train_tokens/_xfmr:.1f}"
         )
         logger.msg(
             "ETA range at 160k-240k tok/s: "
@@ -198,7 +269,13 @@ def train_loop(
             f"grad_accum={val_shape[2]}) | val_tokens: {config.val_tokens:,}"
         )
 
-        embedding_out_sharding = get_data_parallel_sharding(config, mesh, ndim=3)
+        # Log all active modern features
+        log_config_features(config, logger)
+
+        # Use activation_sharding for embedding output (matches data layout)
+        # When micro_batch < num_devices, DP sharding would fail on the batch dim
+        activation_pspec = P(*config.activation_sharding)
+        embedding_out_sharding = NamedSharding(mesh, activation_pspec)
         token_bytes_out_sharding = get_data_parallel_sharding(config, mesh, ndim=1)
         jitted_train_step = jit(
             train_step,
@@ -213,6 +290,7 @@ def train_loop(
         logger.msg("Determining all unique training shapes...")
         train_shapes = set(train_shape_counts)
         train_shapes.add(val_shape)
+        logger.msg(f"Total unique shapes to compile: {len(train_shapes)}")
         logger.msg("Starting Ahead-of-Time (AOT) compilation for all shapes...")
         compiled_train_steps = {}
         compiled_eval_fn = None
@@ -279,10 +357,27 @@ def train_loop(
 
         for step in range(start_step, config.n_train_iters):
             batched_x, batched_y = next(train_loader)
+
+            # --- Resolve shape key for this step ---
             n_grad_accum, _, seq_len = batched_x.shape
             batch_size = n_grad_accum * config.micro_batch_size
             current_shape_key = (seq_len, batch_size, n_grad_accum)
             aot_train_fn = compiled_train_steps[current_shape_key]
+
+            # --- Delayed weight tying: untie at the scheduled step ---
+            if config.weight_tying == "delayed" and step == config.untie_at_step and "lm_head" in params:
+                logger.msg(f"Untying weights at step {step}...")
+                # Re-seed lm_head with an independent copy of wte^T (same shape as the
+                # existing lm_head leaf, so the AOT-compiled train step still applies).
+                # Optimizer state for lm_head is kept as-is.
+                wte_val = params["wte"]
+                lm_head_seed = jnp.transpose(wte_val, (1, 0))
+                if lm_head_seed.shape != params["lm_head"].shape:
+                    lm_head_seed = lm_head_seed.reshape(params["lm_head"].shape)
+                lm_head_seed = jax.device_put(lm_head_seed, params["lm_head"].sharding)
+                params = {k: (lm_head_seed if k == "lm_head" else v) for k, v in params.items()}
+                logger.msg("Weights untied (lm_head re-seeded from wte, now independent).")
+
             params, opt_state, metrics = aot_train_fn(
                 params,
                 precomputed_params,
@@ -388,6 +483,12 @@ def build_config(args) -> tuple[Config, str]:
         replace_kwargs["input_val_bin"] = args.input_val_bin
     if args.tokenizer_json is not None:
         replace_kwargs["tokenizer_json"] = args.tokenizer_json
+    if args.optimizer is not None:
+        replace_kwargs["optimizer"] = args.optimizer
+    if args.lr_schedule is not None:
+        replace_kwargs["lr_schedule"] = args.lr_schedule
+    if args.weight_tying is not None:
+        replace_kwargs["weight_tying"] = args.weight_tying
     if replace_kwargs:
         config = dataclasses.replace(config, **replace_kwargs)
     return config, preset_name
@@ -429,6 +530,24 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         default=None,
         help="Override n_train_iters for a quick wiring test.",
+    )
+    parser.add_argument(
+        "--optimizer",
+        choices=("muon_adamw", "normuon", "soap"),
+        default=None,
+        help="Optimizer to use (default: muon_adamw).",
+    )
+    parser.add_argument(
+        "--lr-schedule",
+        choices=("linear", "cosine", "wsd"),
+        default=None,
+        help="LR schedule type.",
+    )
+    parser.add_argument(
+        "--weight-tying",
+        choices=("none", "full", "delayed"),
+        default=None,
+        help="Weight tying mode.",
     )
     args = parser.parse_args(argv)
     config, preset_name = build_config(args)

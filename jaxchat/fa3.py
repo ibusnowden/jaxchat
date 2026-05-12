@@ -1,4 +1,12 @@
-"""Attention backend selection for the JAX training stack."""
+"""Attention backend selection for the JAX training stack.
+
+Supports:
+- JAX SDPA (native dot_product_attention with sliding window)
+- Pallas GPU MHA (Triton-based FlashAttention)
+- Ring attention (multi-GPU)
+- **Long-short hybrid attention**: per-layer, attend with both full context
+  and a local window, then combine the two results.
+"""
 
 from __future__ import annotations
 
@@ -48,6 +56,20 @@ class AttentionBackendDecision:
 
 
 def layer_window_size(layer_idx: int, config) -> int:
+    """Return the local window size for a given layer.
+
+    If ``use_long_short_attention`` is enabled, layers at even indices get
+    a short window and layers at odd indices get the full sequence length
+    (long context).  Otherwise falls back to ``sliding_window_pattern``.
+    """
+    use_long_short = getattr(config, "use_long_short_attention", False)
+    if use_long_short:
+        if layer_idx % 2 == 0:
+            # Short window: use the first element of sliding_window_pattern
+            return int(config.sliding_window_pattern[0])
+        else:
+            # Long window: full context
+            return config.max_seq_len
     if layer_idx == config.n_layers - 1:
         return config.max_seq_len
     return int(config.sliding_window_pattern[layer_idx % len(config.sliding_window_pattern)])
@@ -110,6 +132,7 @@ def _can_use_pallas_mha(q, k, v, window_size: int, config) -> bool:
 
 
 def _sdpa_attention(q, k, v, *, scale: float, window_size: int):
+    """Standard SDPA with optional sliding window."""
     local_window = None
     if window_size < k.shape[1]:
         local_window = (window_size - 1, 0)
@@ -143,8 +166,50 @@ def _pallas_attention(q, k, v, *, scale: float, config):
     )
 
 
+# ---------------------------------------------------------------------------
+# Long-short hybrid attention
+# ---------------------------------------------------------------------------
+
+def _long_short_attention(
+    q, k, v, *,
+    scale: float,
+    short_window: int,
+    long_window: int,
+    config,
+) -> jax.Array:
+    """Hybrid attention: attend with both a short local window and full context.
+
+    Splits the heads: first half uses short window, second half uses full context.
+    Results are concatenated along the head dimension.
+
+    This emulates the MixAttention / LongNet approach where each layer has
+    both a local and a global receptor field.
+    """
+    n_heads = q.shape[-2]
+    mid = n_heads // 2
+
+    q_short = q[..., :mid, :]
+    k_short = k[..., :mid, :]
+    v_short = v[..., :mid, :]
+    q_long = q[..., mid:, :]
+    k_long = k[..., mid:, :]
+    v_long = v[..., mid:, :]
+
+    out_short = _sdpa_attention(q_short, k_short, v_short, scale=scale, window_size=short_window)
+    out_long = _sdpa_attention(q_long, k_long, v_long, scale=scale, window_size=long_window)
+
+    return jnp.concatenate([out_short, out_long], axis=-2)
+
+
 def backend_decision(q, k, v, *, layer_idx: int, config, mesh=None) -> AttentionBackendDecision:
     window_size = layer_window_size(layer_idx, config)
+
+    # For long-short layers, the long side gets full context
+    use_long_short = getattr(config, "use_long_short_attention", False)
+    if use_long_short and layer_idx % 2 == 1:
+        # Long layers use full context
+        window_size = config.max_seq_len
+
     if _can_use_ring(q, k, v, window_size, mesh, config):
         return AttentionBackendDecision(
             backend="ring",
@@ -157,10 +222,10 @@ def backend_decision(q, k, v, *, layer_idx: int, config, mesh=None) -> Attention
             reason="installed gpu.attention kernel supports this full-context causal shape",
             window_size=window_size,
         )
-    if window_size < q.shape[1]:
+    if window_size < q.shape[1] or use_long_short:
         return AttentionBackendDecision(
             backend="sdpa",
-            reason="installed Pallas kernels in JAX 0.9.1 do not provide training-safe sliding-window causal attention here",
+            reason="falling back to SDPA (sliding window or long-short)",
             window_size=window_size,
         )
     if not _is_gpu_runtime():
@@ -273,8 +338,36 @@ def distributed_ring_attention(q, k, v, *, scale: float, window_size: int, mesh)
 
 
 def attention(q, k, v, *, layer_idx: int, config, mesh=None):
+    """Main attention dispatch.
+
+    Handles long-short hybrid attention, ring, Pallas, and SDPA backends.
+    """
+    use_long_short = getattr(config, "use_long_short_attention", False)
+    window_size = layer_window_size(layer_idx, config)
+
+    if use_long_short:
+        # Long-short hybrid: short window on even layers, full on odd
+        if layer_idx % 2 == 0:
+            short_ws = int(config.sliding_window_pattern[0]) if config.sliding_window_pattern else 512
+            return _long_short_attention(
+                q, k, v,
+                scale=1.0 / math.sqrt(q.shape[-1]),
+                short_window=short_ws,
+                long_window=config.max_seq_len,
+                config=config,
+            )
+        else:
+            # Odd layers: standard attention (full context)
+            decision = backend_decision(q, k, v, layer_idx=layer_idx, config=config, mesh=mesh)
+            scale = 1.0 / math.sqrt(q.shape[-1])
+            if decision.backend == "ring":
+                return distributed_ring_attention(q, k, v, scale=scale, window_size=window_size, mesh=mesh)
+            if decision.backend == "pallas_gpu_mha":
+                return _pallas_attention(q, k, v, scale=scale, config=config)
+            return _sdpa_attention(q, k, v, scale=scale, window_size=window_size)
+
+    # Original dispatch logic
     decision = backend_decision(q, k, v, layer_idx=layer_idx, config=config, mesh=mesh)
-    window_size = decision.window_size
     scale = 1.0 / math.sqrt(q.shape[-1])
     if decision.backend == "ring":
         return distributed_ring_attention(q, k, v, scale=scale, window_size=window_size, mesh=mesh)

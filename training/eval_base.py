@@ -95,7 +95,12 @@ def _top_k_sample(logits: np.ndarray, *, rng: np.random.Generator, top_k: int, t
 
 def _generate_samples(params, precomputed_params, config, tokenizer, mesh) -> list[dict[str, object]]:
     rng = np.random.default_rng(GENERATION_SEED)
-    embedding_out_sharding = get_data_parallel_sharding(config, mesh, ndim=3)
+    # Match training: the embedding-gather output uses ``activation_sharding`` (the
+    # 124m presets set it to (None, None, None) — replicated — because the per-call
+    # batch dim is micro_batch_size, which is smaller than the device count and so
+    # cannot be DP-sharded). Using get_data_parallel_sharding(ndim=3) here would put
+    # 'dp' on the batch axis and fail (4 not divisible by 8).
+    embedding_out_sharding = NamedSharding(mesh, P(*config.activation_sharding))
     bos_id = int(tokenizer.get_bos_token_id())
     samples: list[dict[str, object]] = []
 
@@ -130,7 +135,7 @@ def _generate_samples(params, precomputed_params, config, tokenizer, mesh) -> li
     return samples
 
 
-def evaluate_run(run_dir: str) -> dict[str, object]:
+def evaluate_run(run_dir: str, *, generate_samples: bool = True) -> dict[str, object]:
     run_dir = os.path.abspath(run_dir)
     checkpoint_path, state = _load_latest_checkpoint(run_dir)
     config = state["config"]
@@ -139,11 +144,18 @@ def evaluate_run(run_dir: str) -> dict[str, object]:
 
     mesh = get_mesh(config)
     logger = _EvalLogger()
-    with mesh:
+    # ``jax.set_mesh`` puts a *concrete* mesh in context (not just the abstract
+    # one ``with mesh:`` provides) — eager ops in _generate_samples (e.g. the
+    # SDPA mask's jnp.ones_like) need it, else: "Length of device assignment 1
+    # is not equal to the size of the mesh 8 ... enter your jit into a mesh
+    # context via jax.set_mesh".
+    with mesh, jax.set_mesh(mesh):
         params = _shard_params(params, config, mesh)
         precomputed_params = precompute_rope(config, mesh)
         token_bytes = precompute_token_bytes(config, mesh)
-        embedding_out_sharding = get_data_parallel_sharding(config, mesh, ndim=3)
+        # See _generate_samples: embedding-gather output follows activation_sharding,
+        # not a DP split of the (micro_batch_size,...) batch axis.
+        embedding_out_sharding = NamedSharding(mesh, P(*config.activation_sharding))
         token_bytes_out_sharding = get_data_parallel_sharding(config, mesh, ndim=1)
         activation_sharding = NamedSharding(mesh, P(*config.activation_sharding))
         val_shape = get_eval_shape(config)
@@ -187,8 +199,18 @@ def evaluate_run(run_dir: str) -> dict[str, object]:
             raise RuntimeError("Validation dataset produced no batches.")
         val_bpb = bpb_accum / val_steps
 
-        tokenizer = load_hf_tokenizer(config.tokenizer_json)
-        samples = _generate_samples(params, precomputed_params, config, tokenizer, mesh)
+        logger.msg(f"val_bpb={val_bpb:.4f} (step {step})")
+        # Eager autoregressive sampling re-traces per growing seq-len and dispatches
+        # op-by-op across the 8-device mesh -> minutes.  It's a diagnostic; skip it
+        # for ablation sweeps (--skip-generation) and never let it sink val_bpb.
+        samples: list[dict[str, object]] = []
+        if generate_samples:
+            tokenizer = load_hf_tokenizer(config.tokenizer_json)
+            try:
+                samples = _generate_samples(params, precomputed_params, config, tokenizer, mesh)
+            except Exception as exc:
+                logger.msg(f"[warn] sample generation failed ({type(exc).__name__}: {exc}); reporting val_bpb only.")
+                samples = []
 
     samples_path = os.path.join(run_dir, "samples.txt")
     with open(samples_path, "w", encoding="utf-8") as handle:
@@ -219,9 +241,11 @@ def evaluate_run(run_dir: str) -> dict[str, object]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Evaluate the final staged JAX base-model checkpoint.")
     parser.add_argument("--run-dir", required=True, help="Deterministic run directory containing latest_checkpoint.txt")
+    parser.add_argument("--skip-generation", action="store_true",
+                        help="Only compute val_bpb; skip the (slow) autoregressive sample generation.")
     args = parser.parse_args(argv)
 
-    report = evaluate_run(args.run_dir)
+    report = evaluate_run(args.run_dir, generate_samples=not args.skip_generation)
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0
 

@@ -153,7 +153,18 @@ PRESET_124M_MODERN = _124m_modern
 # but only ~23M of trainable transformer matrices, and a token budget sized off that
 # small number — i.e. the net is FLOP-cheap and param-bottlenecked, exactly where adding
 # recurrence (free compute per param) should pay.  Same data/budget as 124m-modern.
+# RESULT: loses by 0.0152 BPB at 1.31B tokens vs the non-looped baseline — kept for
+# reference but not recommended. See ablation_notes.md #10.
 PRESET_124M_LOOP = dataclasses.replace(_124m_modern, n_recurrence=2)
+
+# 188m-modern: depth=12 modern (Config auto-scales d_model = depth*64 ⇒ d_model=768,
+# n_heads=6, head_dim=128).  Param breakdown at vocab=32768: wte 25.2M, value_embeds
+# 50.3M (n_value_layers=2), lm_head 25.2M, transformer_matrices 75.5M, +12.6M bigram
+# hash table ⇒ ~188M total (53% embedding, 75M of "real" transformer matrices — 3.3×
+# the depth-8 net's 23M).  Best result so far on this preset family: val_bpb 0.8275
+# at 1.31B tokens (vs 0.8878 for 124m-modern at the same budget, 0.8871 for
+# 124m-modern at 2.1B).  ~2.74 s/step on 8×RTX 6000.  See ablation_notes.md #11.
+PRESET_188M_MODERN = dataclasses.replace(_124m_modern, depth=12)
 
 
 PRESETS: dict[str, Config] = {
@@ -164,6 +175,7 @@ PRESETS: dict[str, Config] = {
     "124m": PRESET_124M,
     "124m-modern": PRESET_124M_MODERN,
     "124m-loop": PRESET_124M_LOOP,
+    "188m-modern": PRESET_188M_MODERN,
 }
 
 
@@ -174,6 +186,7 @@ __all__ = [
     "PRESET_124M",
     "PRESET_124M_MODERN",
     "PRESET_124M_LOOP",
+    "PRESET_188M_MODERN",
     "D4",
     "PRESETS",
     "FINEWEB_32K_DIR",

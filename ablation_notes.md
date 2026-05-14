@@ -32,6 +32,7 @@ divided by `n_train_iters`, so they look ~2.5× better than reality on a *resume
 | 8 | **124m-loop** @683M | `n_recurrence=2` (eff. depth 16) | 683M (2605) | none | **0.9166** | 2.89 s/step (1.71× #9) |
 | 9 | modern, no-tie @683M | matched control for #8 | 683M (2605) | none | **0.9261** | 1.69 s/step |
 | 10 | **124m-loop** @1.31B | `n_recurrence=2`, full budget | 1.31B (5000) | none | **0.9030** | **loses to #6 by 0.0152**; 2.02 s/step |
+| 11 | **depth-12** @1.31B | `depth=12` ⇒ d_model=768 auto (188M params, 75M transformer) | 1.31B (5000) | none | **0.8275** | **new SOTA, −0.060 vs #6 & #7**; 2.74 s/step (2.23× #6) |
 
 ## What we've learned
 
@@ -44,7 +45,14 @@ divided by `n_train_iters`, so they look ~2.5× better than reality on a *resume
 - **More tokens dominates everything else — but only up to ~1.3B.** 683M → 1.31B (with `none`) took
   `val_bpb` 1.22 → 0.89. Pushing to 2.1B (#7) only got 0.8871 vs 0.8878 at 1.31B (#6) — **essentially flat**.
   Train data is ~912M unique tokens, so beyond ~1.3B we're re-walking the corpus; the BPB curve flattens.
-  Beyond this budget the lever shifts from "more tokens" to "more params per token" (#3 in the ideas list).
+  Beyond this budget the lever shifts from "more tokens" to "more params per token".
+- **depth=12 (auto-scaled d_model=768) is a big win.** #11 vs #6: same 1.31B token budget, val_bpb
+  0.8275 vs 0.8878 ⇒ **−0.060 BPB**, and the curve was still falling (≈ 0.025 BPB / 500 steps) at the
+  cutoff. Beats #7 (depth-8 at 2.1B tok) by the same 0.060 — so 3.3× the transformer matrices on the
+  *same* data beats 1.6× the tokens on the *same* model, decisively. Per-step cost is 2.23× (2.74 s
+  vs 1.23 s) so at equal wall-clock the comparison shifts, but with `data ≤ ~1.3B unique` the wall-clock
+  comparison is moot — `depth=12` is the right use of compute here. Confirms the diagnosis from #10:
+  this regime is param-bottlenecked, not depth-of-reuse-bottlenecked.
 
 ### ❌ Didn't help (or barely)
 - **WSD vs. linear LR**: ≈ **0.002 BPB** (#2 vs #3). `program.md` predicted 0.05–0.10. Both schedules have an
@@ -66,11 +74,11 @@ divided by `n_train_iters`, so they look ~2.5× better than reality on a *resume
 
 ## Ideas to try (roughly priority order)
 
-1. **depth=12** — wider/deeper transformer. The 124m is 68% lookup tables; depth-12 (d_model=768) is ~78M
-   transformer matrices vs ~23M today (≈3.4×), and the auto-budget grows with it (~1.5B tokens, fine since
-   data is the cap at 1.3B anyway). After the loop result (#10), the obvious read is that we're
-   *param-bottlenecked*, not depth-bottlenecked — reusing 23M parameters more times doesn't beat having
-   78M parameters. Direct comparison against #6 (0.8878 at 1.31B) is the cleanest next experiment.
+1. ~~**depth=12**~~ — ✅ landed (#11). **0.8275 SOTA** at 1.31B tokens. New preset
+   `188m-modern` should expose this directly. Follow-ups: (a) depth=16 (d_model=1024 auto, ~330M params,
+   ~5.7× transformer matrices over depth-8 — at 1.31B that's tokens/transformer-param ≈ 10, borderline
+   under-trained but the cool-down should still help); (b) push the data wall by adding more FineWeb
+   shards so depth-12 can be trained on >1.3B unique tokens (the val curve was still descending).
 2. **Throughput pass** (biggest indirect win once we re-open the data lever or push more steps on depth=12):
    - Get a flash-attention kernel that actually engages on RTX 6000 for these shapes (head_dim=128, n_heads=4,
      sliding-window / long-short combos currently force SDPA) — cuDNN SDPA flash path or a Pallas/Triton kernel.

@@ -28,9 +28,10 @@ divided by `n_train_iters`, so they look ~2.5× better than reality on a *resume
 | 4 | modern, default-init | + `init_style=default` (drop DeepNorm) | 683M (2604) | delayed | **1.1966** | (had untie spike too) |
 | 5 | modern, **long** | `124m-modern` | **1.31B (5000)** | delayed | **1.1068** | spike@3333 cost ~1000 steps |
 | 6 | modern, long, **no-tie** | `124m-modern` + `weight_tying=none` | **1.31B (5000)** | none | **0.8878** | clean monotone descent |
-| 7 | modern, **xlong** | `124m-modern` (none) | 2.1B (8000) | none | _in progress_ | ~2.3 epochs |
-| 8 | **124m-loop** | `n_recurrence=2` (eff. depth 16) | 683M (2605) | none | _in progress_ | weight-shared loop |
-| 9 | modern, no-tie @683M | matched control for #8 | 683M (2605) | none | _in progress_ | |
+| 7 | modern, **xlong** | `124m-modern` (none) | 2.1B (8000) | none | **0.8871** | ≈ flat vs #6 — data-limited past ~1.3B |
+| 8 | **124m-loop** @683M | `n_recurrence=2` (eff. depth 16) | 683M (2605) | none | **0.9166** | 2.89 s/step (1.71× #9) |
+| 9 | modern, no-tie @683M | matched control for #8 | 683M (2605) | none | **0.9261** | 1.69 s/step |
+| 10 | **124m-loop** @1.31B | `n_recurrence=2`, full budget | 1.31B (5000) | none | **0.9030** | **loses to #6 by 0.0152**; 2.02 s/step |
 
 ## What we've learned
 
@@ -40,9 +41,10 @@ divided by `n_train_iters`, so they look ~2.5× better than reality on a *resume
   meaningful (observed at both untie@1736 in #3 and untie@3333 in #5). Switching to plain `weight_tying=none`
   (independent `lm_head` from init) is a clean monotone descent and won the head-to-head by **−0.22 BPB at
   identical budget** (#5 → #6: 1.1068 → 0.8878). → `PRESET_124M_MODERN` default changed `delayed`→`none`.
-- **More tokens dominates everything else.** 683M → 1.31B (with `none`) took `val_bpb` 1.22 → 0.89, and the
-  curve was still falling ~0.06/1000 steps at the budget cutoff. The token budget here is the lever; the
-  bottleneck on it is throughput (see ideas).
+- **More tokens dominates everything else — but only up to ~1.3B.** 683M → 1.31B (with `none`) took
+  `val_bpb` 1.22 → 0.89. Pushing to 2.1B (#7) only got 0.8871 vs 0.8878 at 1.31B (#6) — **essentially flat**.
+  Train data is ~912M unique tokens, so beyond ~1.3B we're re-walking the corpus; the BPB curve flattens.
+  Beyond this budget the lever shifts from "more tokens" to "more params per token" (#3 in the ideas list).
 
 ### ❌ Didn't help (or barely)
 - **WSD vs. linear LR**: ≈ **0.002 BPB** (#2 vs #3). `program.md` predicted 0.05–0.10. Both schedules have an
@@ -50,41 +52,47 @@ divided by `n_train_iters`, so they look ~2.5× better than reality on a *resume
 - **DeepNorm init vs. default init**: ≈ **noise** (#2 vs #4 — default was actually *slightly* better).
   Predicted +0.03–0.08. With QK-norm + RMSNorm everywhere + grad-clip + z-loss already on, the init style
   doesn't move the needle.
+- **Looped / recursive transformer (`n_recurrence=2`).** Directionally positive at 683M (#8 vs #9:
+  0.9166 vs 0.9261, ≈0.01 BPB — within the ±0.02 noise band), but the result **reversed at scale**
+  (#10 vs #6 at 1.31B: 0.9030 vs **0.8878**, loop loses by 0.0152). The loop also costs 1.64× per step
+  (2.02 s vs 1.23 s) — so at *equal wall-clock* a non-looped run trains ~1.64× more tokens (#7 already shows
+  what that buys: ~0.887). Verdict: at this param/data regime the bottleneck is unique parameters, not
+  effective depth; reusing the same 23M of transformer matrices twice doesn't substitute for adding more.
+  Keep `n_recurrence=1` default. Possibly revisit when (a) data isn't capped, or (b) at smaller param
+  counts where the regularizer-like effect dominates.
 - Net: the "modern feature set" as a bundle is worth ~0.1 BPB over plain `124m` (#1 vs #2), and most of that
   isn't the headline features — it's likely the value-embeds + bigram + GQA bookkeeping. Worth re-checking
   each against the new `none` baseline before claiming anything.
 
 ## Ideas to try (roughly priority order)
 
-1. **Looped / recursive transformer** — ✅ *implemented this round* (`Config.n_recurrence`, `PRESET_124M_LOOP`).
-   Apply the block stack `n_recurrence` times, weight-shared, with a per-loop "timestep" embedding added to the
-   residual stream (the Saunshi "Reasoning with Latent Thoughts" / Kevin671 2410.01405 recipe — the timestep
-   embed breaks the fixed-point symmetry that otherwise collapses a reused block). Effective depth = `n_layers ×
-   n_recurrence` at `n_layers` params. This is the most natural fit for *this* model: it's FLOP-cheap and
-   param-bottlenecked (~23M transformer, budget sized off that), so recurrence buys "free compute per param".
-   First test: `n_recurrence=2` (eff. depth 16) vs the matched non-looped control at 683M (#8 vs #9). If it
-   wins, re-run at 1.31B+ and make it the default; then sweep `n_recurrence ∈ {3,4}` and try
-   per-loop LR / per-effective-layer `resid_lambdas`.
-2. **Throughput pass** (biggest indirect win on `val_bpb`, since more tokens = lower loss):
+1. **depth=12** — wider/deeper transformer. The 124m is 68% lookup tables; depth-12 (d_model=768) is ~78M
+   transformer matrices vs ~23M today (≈3.4×), and the auto-budget grows with it (~1.5B tokens, fine since
+   data is the cap at 1.3B anyway). After the loop result (#10), the obvious read is that we're
+   *param-bottlenecked*, not depth-bottlenecked — reusing 23M parameters more times doesn't beat having
+   78M parameters. Direct comparison against #6 (0.8878 at 1.31B) is the cleanest next experiment.
+2. **Throughput pass** (biggest indirect win once we re-open the data lever or push more steps on depth=12):
    - Get a flash-attention kernel that actually engages on RTX 6000 for these shapes (head_dim=128, n_heads=4,
      sliding-window / long-short combos currently force SDPA) — cuDNN SDPA flash path or a Pallas/Triton kernel.
    - ZeRO-1 optimizer-state sharding (one slice of Muon/AdamW state per rank) — currently fully replicated.
    - Re-test `--xla_gpu_enable_triton_gemm=True` on RTX 6000 Ada + JAX 0.9.1 (was disabled for breaking autotune).
    - Target: `mfu_proxy` ≫ 0.016, then spend the saved wall-clock on tokens.
-3. **depth=12** — `d_model=768`, ~78M transformer matrices (≈3.4× the depth-8 net), token budget auto-grows to
-   ~1.5B. Conventional "more capacity" bet; downside is it re-grows `wte`/`lm_head` to ~25M each. Run after the
-   loop result so we know whether recurrence or width is the better use of the FLOPs.
-4. **muP-style LR sweep** on the locked config — a few % of steps could come off; the optimizer LRs
+3. **Get more unique data.** We hit a data wall at ~1.3B tokens on the existing `fineweb32k_real` shards
+   (~912M unique). Pull in more FineWeb-Edu shards (or mix in another high-quality corpus) so the
+   token-budget lever re-opens past 1.3B. This is a prerequisite for the depth-12 experiment to *actually*
+   benefit from its larger budget, and for any future scale-up.
+4. ~~**Looped / recursive transformer**~~ — tested (#8/#9/#10); doesn't help at this scale, see "Didn't help" above.
+5. **muP-style LR sweep** on the locked config — a few % of steps could come off; the optimizer LRs
    (`muon_base_lr`, `embed_lr_base`, `lm_head_lr_base`, …) were never tuned for this scale.
-5. **Re-run the P0–P3 single-feature ablations against the new `weight_tying=none` baseline** so the
+6. **Re-run the P0–P3 single-feature ablations against the new `weight_tying=none` baseline** so the
    contribution table is honest (`runs/rtx_124m_ablation.sh <name>` does one per job: `no-wsd`, `no-clip`,
    `default-init`, `no-zloss`, `no-tying`, `no-seqwarmup`, `no-bigram`, `no-longshort`, `no-crossdoc`,
    `sigmoid-cap`, `no-skip`, `full-mha`).
-6. **Curriculum / data ordering** — e.g. a difficulty-sorted warmup (train a tiny doc-difficulty classifier on
+7. **Curriculum / data ordering** — e.g. a difficulty-sorted warmup (train a tiny doc-difficulty classifier on
    an LLM-labelled subset, then sample easy→hard for the first 10–20%). Holding model+optimizer+compute fixed,
    how much variance is data ordering vs. seed? (Worth a seed-variance run first to know what "significant" means.)
-7. **Optimizer swaps** — Dion (Microsoft) instead of Muon; NorMuon / SOAP are already implemented but unbenchmarked here.
-8. **Low-rank value embeds** — `value_embeds` is 33.6M (the second-biggest table); `(n_value_layers, vocab, r)·(n_value_layers, r, d_model)` with `r=d_model//4` would reclaim ~25M of params for the transformer (or shrink the model).
+8. **Optimizer swaps** — Dion (Microsoft) instead of Muon; NorMuon / SOAP are already implemented but unbenchmarked here.
+9. **Low-rank value embeds** — `value_embeds` is 33.6M (the second-biggest table); `(n_value_layers, vocab, r)·(n_value_layers, r, d_model)` with `r=d_model//4` would reclaim ~25M of params for the transformer (or shrink the model).
 
 ## Tooling added this round
 - `scripts/base_train.py --config-override KEY=VALUE` — repeatable, type-coerced from the `Config` dataclass.

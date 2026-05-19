@@ -35,7 +35,6 @@ from jaxchat import wandb_log as wb  # noqa: E402
 from jaxchat.model import (  # noqa: E402
     Logger,
     count_parameters,
-    get_data_parallel_sharding,
     get_mesh,
     get_weight_sharding,
     init_optimizer,
@@ -180,8 +179,11 @@ def main(argv: list[str] | None = None) -> int:
         param_count = count_parameters(params)
         logger.msg(f"SFT preset | params: {param_count:,} | tokens_per_step: {tokens_per_step:,} | iters: {args.n_iters}")
 
-        embedding_out_sharding = get_data_parallel_sharding(sft_config, mesh, ndim=3)
+        # Match train_base: embedding-output activations follow
+        # ``config.activation_sharding`` (replicated batch on the 124m presets)
+        # so micro_batch_size < dp doesn't trip a divisibility error.
         activation_sharding = NamedSharding(mesh, P(*sft_config.activation_sharding))
+        embedding_out_sharding = activation_sharding
 
         jitted = jit(
             sft_train_step,

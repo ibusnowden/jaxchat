@@ -47,7 +47,6 @@ from jaxchat.engine import Engine  # noqa: E402
 from jaxchat.model import (  # noqa: E402
     Logger,
     count_parameters,
-    get_data_parallel_sharding,
     get_mesh,
     get_weight_sharding,
     gpt_forward,
@@ -234,9 +233,17 @@ def main(argv: list[str] | None = None) -> int:
         param_count = count_parameters(params)
         logger.msg(f"RL preset | params: {param_count:,} | iters: {args.n_iters} | M={args.m_prompts} G={args.g_rollouts}")
 
-        embedding_out_sharding = get_data_parallel_sharding(rl_config, mesh, ndim=3)
-        token_sharding = get_data_parallel_sharding(rl_config, mesh, ndim=2)
-        adv_sharding = get_data_parallel_sharding(rl_config, mesh, ndim=1)
+        # Match train_base / engine: the embedding-output activations follow
+        # ``config.activation_sharding`` (replicated batch on the 124m presets);
+        # the engine reuses this for batch=1 autoregressive sampling. The RL
+        # train batch (M*G prompts) often does divide dp evenly, but we play it
+        # safe and route everything through the same replicated layout.
+        activation_sharding_3d = NamedSharding(mesh, P(*rl_config.activation_sharding))
+        embedding_out_sharding = activation_sharding_3d
+        # ``token_sharding`` (idx/labels/mask) and ``adv_sharding`` (advantages)
+        # also default to the replicated-batch layout for the same reason.
+        token_sharding = NamedSharding(mesh, P(None, None))
+        adv_sharding = NamedSharding(mesh, P(None))
 
         # Build a temporary engine for sampling that shares params (we'll refresh after each step).
         engine = Engine(

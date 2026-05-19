@@ -25,9 +25,10 @@ import numpy as np
 from jax import jit
 from jax.tree_util import tree_map
 
+from jax.sharding import NamedSharding, PartitionSpec as P
+
 from jaxchat import checkpoint as ckpt_lib
 from jaxchat.model import (
-    get_data_parallel_sharding,
     get_mesh,
     get_weight_sharding,
     gpt_forward,
@@ -126,7 +127,11 @@ class Engine:
         params = tree_map(lambda leaf: jax.device_put(jnp.asarray(leaf), weight_sharding), state["params"])
         with mesh:
             precomputed_params = precompute_rope(config, mesh)
-        embedding_out_sharding = get_data_parallel_sharding(config, mesh, ndim=3)
+        # Match train_base / eval_base: the embedding/output activations use
+        # ``config.activation_sharding`` (replicated batch for the 124m presets)
+        # so single-sample inference works on multi-GPU meshes where batch=1
+        # would not divide ``dp``.
+        embedding_out_sharding = NamedSharding(mesh, P(*config.activation_sharding))
         tok_path = tokenizer_path or state.get("tokenizer_path") or config.tokenizer_json
         if not tok_path:
             raise RuntimeError(

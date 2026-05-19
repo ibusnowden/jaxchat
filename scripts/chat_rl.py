@@ -78,7 +78,7 @@ def rl_loss_fn(params, ref_params, batch, precomputed_params, config, embedding_
     clipped_ratio = jnp.clip(ratio, 1.0 - clip_eps, 1.0 + clip_eps)
     pg = -(jnp.minimum(advantages * ratio, advantages * clipped_ratio) * mask_f).sum() / denom
     kl = ((logp_token - ref_logp_token) * mask_f).sum() / denom
-    return pg + kl_beta * kl, {"pg": pg, "kl": kl, "approx_kl": float(kl), "ratio_mean": float(jnp.mean(ratio))}
+    return pg + kl_beta * kl, {"pg": pg, "kl": kl, "ratio_mean": jnp.mean(ratio)}
 
 
 @partial(jit, static_argnames=("optimizer", "config", "embedding_out_sharding", "kl_beta", "clip_eps"))

@@ -14,18 +14,21 @@ from jaxchat.model import Config
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# 32k-BPE FineWeb assets.  ``fineweb32k_real`` holds shards that were tokenized with
-# the 32k tokenizer (see ``data/retokenize_bins.py``).  The older ``fineweb32k`` dir was
-# a symlink to GPT-2-tokenized shards (vocab 50257) -- feeding those into a 32k-vocab
-# model silently corrupts the embedding gather and labels, i.e. immediate loss=nan.
-# Prefer the re-tokenized shards when present; fall back to the legacy dir otherwise.
+# 32k-BPE FineWeb assets.  ``fineweb32k_real_29`` holds the extended re-tokenized
+# pool (~2.94B train / 101M val tokens, retokenized from 29 GPT-2 source shards).
+# ``fineweb32k_real`` is the original 9-shard re-tokenization (~912M train).  The
+# legacy ``fineweb32k`` dir is a symlink to GPT-2-tokenized shards (vocab 50257) --
+# feeding those into a 32k-vocab model silently corrupts the embedding gather and
+# labels, i.e. immediate loss=nan.  Prefer the largest available real dir.
+_FINEWEB_32K_REAL_29_DIR = os.path.join(PROJECT_ROOT, "data", "fineweb32k_real_29")
 _FINEWEB_32K_REAL_DIR = os.path.join(PROJECT_ROOT, "data", "fineweb32k_real")
 _FINEWEB_32K_LEGACY_DIR = os.path.join(PROJECT_ROOT, "data", "fineweb32k")
-FINEWEB_32K_DIR = (
-    _FINEWEB_32K_REAL_DIR
-    if os.path.isfile(os.path.join(_FINEWEB_32K_REAL_DIR, "fineweb_val_000000.bin"))
-    else _FINEWEB_32K_LEGACY_DIR
-)
+if os.path.isfile(os.path.join(_FINEWEB_32K_REAL_29_DIR, "fineweb_val_000000.bin")):
+    FINEWEB_32K_DIR = _FINEWEB_32K_REAL_29_DIR
+elif os.path.isfile(os.path.join(_FINEWEB_32K_REAL_DIR, "fineweb_val_000000.bin")):
+    FINEWEB_32K_DIR = _FINEWEB_32K_REAL_DIR
+else:
+    FINEWEB_32K_DIR = _FINEWEB_32K_LEGACY_DIR
 FINEWEB_TRAIN_GLOB = os.path.join(FINEWEB_32K_DIR, "fineweb_train_*.bin")
 FINEWEB_VAL_BIN = os.path.join(FINEWEB_32K_DIR, "fineweb_val_000000.bin")
 FINEWEB_TOKENIZER_JSON = os.path.join(FINEWEB_32K_DIR, "tokenizer.json")

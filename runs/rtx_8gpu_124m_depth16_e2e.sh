@@ -168,8 +168,8 @@ $PY -m scripts.chat_rl \
   --rl-data "$RL_DATA_TRAIN" \
   --run-dir "$RL_RUN" \
   --n-iters 60 \
-  --m-prompts 4 \
-  --g-rollouts 4 \
+  --m-prompts 2 \
+  --g-rollouts 2 \
   --max-new-tokens 128
 
 # --------------------------------------------------------------------------

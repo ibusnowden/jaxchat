@@ -234,16 +234,18 @@ def main(argv: list[str] | None = None) -> int:
         param_count = count_parameters(params)
         logger.msg(f"RL preset | params: {param_count:,} | iters: {args.n_iters} | M={args.m_prompts} G={args.g_rollouts}")
 
-        # Two shardings: the engine samples one prompt at a time (batch=1) and
-        # so needs a replicated-batch layout — ``P(*activation_sharding)`` — to
-        # avoid the "1 doesn't divide dp=8" failure. The RL train step, by
-        # contrast, runs on M*G prompts (16 by default) which divides dp
-        # cleanly, so DP-sharding the batch keeps per-GPU activation memory
-        # bounded (replicated activations OOM at depth=16).
-        engine_emb_sharding = NamedSharding(mesh, P(*rl_config.activation_sharding))
-        train_emb_sharding = NamedSharding(mesh, P("dp", None, None))
-        token_sharding = NamedSharding(mesh, P("dp", None))
-        adv_sharding = NamedSharding(mesh, P("dp"))
+        # Match base_train / chat_sft: route everything through
+        # ``config.activation_sharding`` (replicated batch on the 124m
+        # presets). This (a) lets the Engine sample with batch=1 (DP would
+        # fail on 1 % 8 ≠ 0), and (b) avoids the JAX sharding-inference
+        # error on the bigram-hash gather ``bigram_bucket[pairs[...,0],
+        # pairs[...,1]]`` — that gather can't resolve when the indices are
+        # DP-sharded but the (vocab, vocab) lookup table is replicated.
+        # Memory: with M*G small (e.g. 4) on the 124m presets, replicated
+        # activations fit on 48 GiB RTX 6000.
+        embedding_out_sharding = NamedSharding(mesh, P(*rl_config.activation_sharding))
+        token_sharding = NamedSharding(mesh, P(None, None))
+        adv_sharding = NamedSharding(mesh, P(None))
 
         # Build a temporary engine for sampling that shares params (we'll refresh after each step).
         engine = Engine(
@@ -252,7 +254,7 @@ def main(argv: list[str] | None = None) -> int:
             config=rl_config,
             mesh=mesh,
             tokenizer=tokenizer,
-            embedding_out_sharding=engine_emb_sharding,
+            embedding_out_sharding=embedding_out_sharding,
             stage="rl",
             step=0,
         )
@@ -321,7 +323,7 @@ def main(argv: list[str] | None = None) -> int:
                 precomputed_params,
                 opt_state,
                 optimizer,
-                train_emb_sharding,
+                embedding_out_sharding,
                 idx_d,
                 lbl_d,
                 mask_d,

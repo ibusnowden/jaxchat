@@ -39,6 +39,7 @@ import jax  # noqa: E402
 import jax.numpy as jnp  # noqa: E402
 import numpy as np  # noqa: E402
 from jax import jit, value_and_grad  # noqa: E402
+from jax.sharding import NamedSharding, PartitionSpec as P  # noqa: E402
 from jax.tree_util import tree_map  # noqa: E402
 
 from jaxchat import checkpoint as ckpt_lib  # noqa: E402

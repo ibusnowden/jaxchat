@@ -33,6 +33,11 @@ FINEWEB_TRAIN_GLOB = os.path.join(FINEWEB_32K_DIR, "fineweb_train_*.bin")
 FINEWEB_VAL_BIN = os.path.join(FINEWEB_32K_DIR, "fineweb_val_000000.bin")
 FINEWEB_TOKENIZER_JSON = os.path.join(FINEWEB_32K_DIR, "tokenizer.json")
 
+FINEWEB_65K_DIR = os.path.join(PROJECT_ROOT, "data", "fineweb65k")
+FINEWEB_65K_TOKENIZER = os.path.join(FINEWEB_65K_DIR, "tokenizer", "tokenizer.pkl")
+FINEWEB_65K_TRAIN_GLOB = os.path.join(FINEWEB_65K_DIR, "fineweb_train_*.bin")
+FINEWEB_65K_VAL_BIN = os.path.join(FINEWEB_65K_DIR, "fineweb_val_000000.bin")
+
 # Single-H100 d4 assets.  Tokenizer/data are produced by the d4 speedrun.
 FINEWEB_8K_DIR = os.path.join(PROJECT_ROOT, "data", "fineweb8k")
 FINEWEB_8K_TRAIN_GLOB = os.path.join(FINEWEB_8K_DIR, "fineweb_train_*.bin")
@@ -169,6 +174,36 @@ PRESET_124M_LOOP = dataclasses.replace(_124m_modern, n_recurrence=2)
 # 124m-modern at 2.1B).  ~2.74 s/step on 8×RTX 6000.  See ablation_notes.md #11.
 PRESET_188M_MODERN = dataclasses.replace(_124m_modern, depth=12)
 
+PRESET_0P56B_RUST65K = dataclasses.replace(
+    _124m_modern,
+    input_bin=FINEWEB_65K_TRAIN_GLOB,
+    input_val_bin=FINEWEB_65K_VAL_BIN,
+    tokenizer_json=FINEWEB_65K_TOKENIZER,
+    tokenizer_name="fineweb65k",
+    depth=20,
+    vocab_size=65_536,
+    n_kv_heads=10,
+    n_value_layers=0,
+    min_seq_len=2048,
+    max_seq_len=2048,
+    sequence_warmup_intervals=0,
+    tokens_per_step=524_288,
+    micro_batch_size=256,
+    train_token_ratio=20.0,
+    target_train_tokens=11_219_763_200,
+    n_train_iters=21_400,
+    n_warmup_iters=0,
+    val_loss_every=100,
+    val_tokens=524_288,
+    save_every=200,
+    log_every=1,
+    eval_at_start=True,
+    activation_sharding=(None, "dp", None),
+    use_long_short_attention=False,
+    bigram_hash_embed=False,
+    skip_connections=(),
+)
+
 
 PRESETS: dict[str, Config] = {
     "default": DEFAULT_CONFIG,
@@ -179,6 +214,7 @@ PRESETS: dict[str, Config] = {
     "124m-modern": PRESET_124M_MODERN,
     "124m-loop": PRESET_124M_LOOP,
     "188m-modern": PRESET_188M_MODERN,
+    "0p56b-rust65k": PRESET_0P56B_RUST65K,
 }
 
 
@@ -190,12 +226,17 @@ __all__ = [
     "PRESET_124M_MODERN",
     "PRESET_124M_LOOP",
     "PRESET_188M_MODERN",
+    "PRESET_0P56B_RUST65K",
     "D4",
     "PRESETS",
     "FINEWEB_32K_DIR",
     "FINEWEB_TRAIN_GLOB",
     "FINEWEB_VAL_BIN",
     "FINEWEB_TOKENIZER_JSON",
+    "FINEWEB_65K_DIR",
+    "FINEWEB_65K_TOKENIZER",
+    "FINEWEB_65K_TRAIN_GLOB",
+    "FINEWEB_65K_VAL_BIN",
     "FINEWEB_8K_DIR",
     "FINEWEB_8K_TRAIN_GLOB",
     "FINEWEB_8K_VAL_BIN",

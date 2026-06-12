@@ -122,7 +122,7 @@ except ImportError:  # pragma: no cover - optional during tests
     tiktoken = None
 
 from jaxchat.fa3 import attention as fa3_attention
-from jaxchat.tokenizer import load_hf_tokenizer
+from jaxchat.tokenizer import load_tokenizer
 from jaxchat.optimizer import create_optimizer
 from jaxchat.schedules import get_shape_for_step, get_train_shape_counts as schedules_get_train_shape_counts, format_shape_summary as schedules_format_shape_summary, get_eval_shape as schedules_get_eval_shape
 from jaxchat.data_mixer import mean_loss_masked, build_doc_boundary_mask
@@ -249,6 +249,8 @@ class Config:
     val_loss_every: int = 125
     val_tokens: int = 524288
     save_every: int = 0
+    log_every: int = 10
+    eval_at_start: bool = False
     # --- Batch / sequence ---
     tokens_per_step: int = 524288
     batch_size: int = 0
@@ -483,6 +485,27 @@ def parameter_breakdown_from_params(params: Pytree) -> dict[str, int]:
     return counts
 
 
+def parameter_optimizer_labels(params: Pytree) -> dict[str, str]:
+    """Return the optimizer group label for each parameter leaf."""
+    labels: dict[str, str] = {}
+    for path, leaf in tree_flatten_with_path(params)[0]:
+        names = path_to_names(path)
+        key = "/".join(names)
+        if names and names[0] in {"wte", "value_embeds"}:
+            labels[key] = "adam_embed"
+        elif names and names[0] == "lm_head":
+            labels[key] = "adam_lm_head"
+        elif names and names[0] in {"resid_lambdas", "lm_head_norm", "skip_lambdas"}:
+            labels[key] = "adam_resid"
+        elif names and names[0] == "x0_lambdas":
+            labels[key] = "adam_x0"
+        elif getattr(leaf, "ndim", 0) == 2:
+            labels[key] = "muon"
+        else:
+            labels[key] = "adam_resid"
+    return labels
+
+
 def count_parameters(params: Pytree) -> int:
     return sum(int(leaf.size) for leaf in tree_leaves(params))
 
@@ -670,11 +693,11 @@ def precompute_rope(config: Config, mesh: Mesh) -> Pytree:
     return result
 
 
-def _load_hf_tokenizer(config: Config):
+def _load_config_tokenizer(config: Config):
     if not config.tokenizer_json:
         return None
     try:
-        return load_hf_tokenizer(config.tokenizer_json)
+        return load_tokenizer(config.tokenizer_json)
     except (FileNotFoundError, ImportError, OSError, RuntimeError, ValueError):
         return None
 
@@ -682,7 +705,7 @@ def _load_hf_tokenizer(config: Config):
 def precompute_token_bytes(config: Config, mesh: Mesh) -> jax.Array:
     weight_sharding = get_weight_sharding(config, mesh)
     token_bytes = np.ones(config.vocab_size, dtype=np.int32)
-    tokenizer = _load_hf_tokenizer(config)
+    tokenizer = _load_config_tokenizer(config)
     if tokenizer is not None:
         for token_id in range(config.vocab_size):
             try:

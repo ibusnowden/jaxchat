@@ -10,7 +10,7 @@ Notes:
       can be reused across prompt lengths.  That is fast enough for the d4
       (~11M-param) target on a single H100 and avoids the complexity of a
       cache layout that would couple to the attention dispatcher in fa3.py.
-    - Tokenizer is loaded via :func:`jaxchat.tokenizer.load_hf_tokenizer`.
+    - Tokenizer is loaded via :func:`jaxchat.tokenizer.load_tokenizer`.
 """
 
 from __future__ import annotations
@@ -34,7 +34,8 @@ from jaxchat.model import (
     gpt_forward,
     precompute_rope,
 )
-from jaxchat.tokenizer import load_hf_tokenizer
+from jaxchat.tokenizer import load_tokenizer
+from jaxchat.tools import execute_python
 
 
 def _logits_at(params, precomputed_params, config, embedding_out_sharding, idx_padded, pos):
@@ -138,7 +139,7 @@ class Engine:
                 "No tokenizer_path on checkpoint and config.tokenizer_json is empty; "
                 "pass tokenizer_path= explicitly."
             )
-        tokenizer = load_hf_tokenizer(tok_path)
+        tokenizer = load_tokenizer(tok_path)
         return cls(
             params=params,
             precomputed_params=precomputed_params,
@@ -171,6 +172,26 @@ class Engine:
                 n - 1,
             )
         return np.asarray(jax.device_get(logits))
+
+    def prefill_ids(self, prompt_ids: list[int]) -> dict:
+        """Create a decode cache object.
+
+        The current cache stores token ids and preserves the future KV-cache API
+        shape. Attention KV tensors can be added behind this interface without
+        changing callers.
+        """
+        return {"ids": list(prompt_ids)}
+
+    def decode_one(self, cache: dict, *, temperature: float = 0.8, top_k: int | None = 40,
+                   top_p: float | None = None, seed: int = 0) -> tuple[int, dict]:
+        rng = np.random.default_rng(seed)
+        ids = list(cache.get("ids", []))
+        logits = self._next_token_logits(ids)
+        logits = _apply_temperature(logits, temperature)
+        logits = _top_k_top_p_filter(logits, top_k, top_p)
+        tok = _sample(rng, logits)
+        ids.append(tok)
+        return tok, {"ids": ids}
 
     def generate_ids(
         self,
@@ -252,9 +273,54 @@ class Engine:
             seed=seed,
             stop_token_ids=stop_ids,
         )
-        if gen_ids and gen_ids[-1] == end_id:
+        # Strip any trailing stop token (assistant_end or bos) — generate_ids
+        # appends the stop token before breaking, and special tokens decode to
+        # their literal "<|...|>" surface form (skip_special_tokens=False),
+        # which would otherwise leak into the rendered reply.
+        if gen_ids and gen_ids[-1] in stop_ids:
             gen_ids = gen_ids[:-1]
         return self.tokenizer.decode(gen_ids)
+
+    def chat_with_tools(
+        self,
+        messages: list[dict],
+        *,
+        max_new_tokens: int = 256,
+        temperature: float = 0.7,
+        top_k: int | None = 50,
+        top_p: float | None = 0.95,
+        seed: int = 0,
+        max_tool_rounds: int = 2,
+        tool_timeout_s: float = 2.0,
+    ) -> dict:
+        """Chat and execute local Python tool calls emitted with special tokens."""
+        working = list(messages)
+        events: list[dict] = []
+        reply = ""
+        for round_idx in range(max(max_tool_rounds, 0) + 1):
+            reply = self.chat(
+                working,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                seed=seed + round_idx,
+            )
+            start = reply.find("<|python_start|>")
+            end = reply.find("<|python_end|>", start + 1)
+            if start < 0 or end < 0:
+                return {"reply": reply, "events": events}
+            code = reply[start + len("<|python_start|>"):end].strip()
+            result = execute_python(code, timeout_s=tool_timeout_s)
+            events.append({"type": "python", "code": code, **result})
+            tool_augmented = (
+                reply[: end + len("<|python_end|>")]
+                + "<|output_start|>"
+                + result["output"]
+                + "<|output_end|>"
+            )
+            working = working + [{"role": "assistant", "content": tool_augmented}]
+        return {"reply": reply, "events": events}
 
     def score_continuation(self, ctx_ids: list[int], cont_ids: list[int]) -> float:
         """Sum log-probs of ``cont_ids`` conditioned on ``ctx_ids`` (natural log).

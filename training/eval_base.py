@@ -36,7 +36,7 @@ from jaxchat.model import (
     precompute_rope,
     precompute_token_bytes,
 )
-from jaxchat.tokenizer import load_hf_tokenizer
+from jaxchat.tokenizer import load_tokenizer
 
 
 FIXED_PROMPTS = (
@@ -205,7 +205,7 @@ def evaluate_run(run_dir: str, *, generate_samples: bool = True) -> dict[str, ob
         # for ablation sweeps (--skip-generation) and never let it sink val_bpb.
         samples: list[dict[str, object]] = []
         if generate_samples:
-            tokenizer = load_hf_tokenizer(config.tokenizer_json)
+            tokenizer = load_tokenizer(config.tokenizer_json)
             try:
                 samples = _generate_samples(params, precomputed_params, config, tokenizer, mesh)
             except Exception as exc:

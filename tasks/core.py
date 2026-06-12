@@ -43,10 +43,13 @@ def evaluate_task(engine: Engine, examples: Iterable[RankedExample], *, normaliz
         total += 1
         if pred == ex.gold_idx:
             correct += 1
+    accuracy = (correct / total) if total else 0.0
+    stderr = (accuracy * (1.0 - accuracy) / total) ** 0.5 if total else 0.0
     return {
         "n": total,
         "correct": correct,
-        "accuracy": (correct / total) if total else 0.0,
+        "accuracy": accuracy,
+        "stderr": stderr,
     }
 
 
@@ -57,10 +60,15 @@ def run_subset(engine: Engine, *, n_per_task: int = 200) -> dict:
     task instead of failing the whole eval.
     """
 
-    from tasks import arc_easy, hellaswag, piqa
+    from tasks import arc_challenge, arc_easy, hellaswag, piqa
 
     out: dict[str, dict] = {}
-    for name, loader in (("arc_easy", arc_easy.load_examples), ("hellaswag", hellaswag.load_examples), ("piqa", piqa.load_examples)):
+    for name, loader in (
+        ("arc_easy", arc_easy.load_examples),
+        ("arc_challenge", arc_challenge.load_examples),
+        ("hellaswag", hellaswag.load_examples),
+        ("piqa", piqa.load_examples),
+    ):
         try:
             examples = loader(n_max=n_per_task)
         except Exception as exc:  # pragma: no cover - dataset availability is env-specific
@@ -68,9 +76,20 @@ def run_subset(engine: Engine, *, n_per_task: int = 200) -> dict:
             continue
         out[name] = evaluate_task(engine, examples)
     if out:
-        accuracies = [v["accuracy"] for v in out.values() if "accuracy" in v]
+        scored = [v for v in out.values() if isinstance(v, dict) and "accuracy" in v]
+        accuracies = [v["accuracy"] for v in scored]
         if accuracies:
             out["_mean_accuracy"] = sum(accuracies) / len(accuracies)
+            # Macro uncertainty for the task-average score.  This is an
+            # approximation, but it is far more honest than plotting a clean
+            # trend line through 100-example task subsets.
+            out["_mean_stderr"] = (sum(v.get("stderr", 0.0) ** 2 for v in scored) ** 0.5) / len(scored)
+            out["_task_count"] = len(scored)
+            out["_total_n"] = sum(int(v.get("n", 0)) for v in scored)
+            out["_total_correct"] = sum(int(v.get("correct", 0)) for v in scored)
+            out["_micro_accuracy"] = (
+                out["_total_correct"] / out["_total_n"] if out["_total_n"] else 0.0
+            )
     return out
 
 

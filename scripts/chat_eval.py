@@ -17,7 +17,7 @@ model_lib.configure_jax_runtime()
 
 from jaxchat.engine import Engine  # noqa: E402
 from tasks.core import run_subset  # noqa: E402
-from tasks import gsm8k  # noqa: E402
+from tasks import gsm8k, humaneval, mmlu  # noqa: E402
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -27,8 +27,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--core-n", type=int, default=200)
     parser.add_argument("--gsm8k-n", type=int, default=100)
     parser.add_argument("--gsm8k-max-new-tokens", type=int, default=256)
+    parser.add_argument("--mmlu-n", type=int, default=200)
+    parser.add_argument("--humaneval-n", type=int, default=20)
     parser.add_argument("--skip-core", action="store_true")
     parser.add_argument("--skip-gsm8k", action="store_true")
+    parser.add_argument("--skip-mmlu", action="store_true")
+    parser.add_argument("--skip-humaneval", action="store_true")
     parser.add_argument("--tokenizer-json", default=None)
     args = parser.parse_args(argv)
 
@@ -42,6 +46,16 @@ def main(argv: list[str] | None = None) -> int:
             out["gsm8k"] = gsm8k.evaluate(engine, n_max=args.gsm8k_n, max_new_tokens=args.gsm8k_max_new_tokens)
         except Exception as exc:  # pragma: no cover - environment-specific
             out["gsm8k"] = {"error": f"{type(exc).__name__}: {exc}"}
+    if not args.skip_mmlu:
+        try:
+            out["mmlu"] = mmlu.evaluate(engine, n_max=args.mmlu_n)
+        except Exception as exc:  # pragma: no cover - environment-specific
+            out["mmlu"] = {"error": f"{type(exc).__name__}: {exc}"}
+    if not args.skip_humaneval:
+        try:
+            out["humaneval"] = humaneval.evaluate(engine, n_max=args.humaneval_n)
+        except Exception as exc:  # pragma: no cover - environment-specific
+            out["humaneval"] = {"error": f"{type(exc).__name__}: {exc}"}
 
     out_path = os.path.join(out["run_dir"], "chat_eval.json")
     with open(out_path, "w", encoding="utf-8") as handle:

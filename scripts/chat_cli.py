@@ -27,6 +27,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--top-k", type=int, default=50)
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--tools", action="store_true", help="Enable local Python tool execution loop.")
     parser.add_argument(
         "--prompt",
         default=None,
@@ -38,14 +39,25 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Loaded {engine.stage} stage @ step {engine.step}")
 
     if args.prompt is not None:
-        text = engine.chat(
-            [{"role": "user", "content": args.prompt}],
-            max_new_tokens=args.max_new_tokens,
-            temperature=args.temperature,
-            top_k=args.top_k,
-            top_p=args.top_p,
-            seed=args.seed,
-        )
+        if args.tools:
+            result = engine.chat_with_tools(
+                [{"role": "user", "content": args.prompt}],
+                max_new_tokens=args.max_new_tokens,
+                temperature=args.temperature,
+                top_k=args.top_k,
+                top_p=args.top_p,
+                seed=args.seed,
+            )
+            text = result["reply"]
+        else:
+            text = engine.chat(
+                [{"role": "user", "content": args.prompt}],
+                max_new_tokens=args.max_new_tokens,
+                temperature=args.temperature,
+                top_k=args.top_k,
+                top_p=args.top_p,
+                seed=args.seed,
+            )
         print(text)
         return 0
 
@@ -68,14 +80,27 @@ def main(argv: list[str] | None = None) -> int:
             continue
         messages.append({"role": "user", "content": user})
         seed += 1
-        reply = engine.chat(
-            messages,
-            max_new_tokens=args.max_new_tokens,
-            temperature=args.temperature,
-            top_k=args.top_k,
-            top_p=args.top_p,
-            seed=seed,
-        )
+        if args.tools:
+            result = engine.chat_with_tools(
+                messages,
+                max_new_tokens=args.max_new_tokens,
+                temperature=args.temperature,
+                top_k=args.top_k,
+                top_p=args.top_p,
+                seed=seed,
+            )
+            for event in result["events"]:
+                print(f"tool:python> {event['code']}\n{event['output']}")
+            reply = result["reply"]
+        else:
+            reply = engine.chat(
+                messages,
+                max_new_tokens=args.max_new_tokens,
+                temperature=args.temperature,
+                top_k=args.top_k,
+                top_p=args.top_p,
+                seed=seed,
+            )
         print(f"bot> {reply}")
         messages.append({"role": "assistant", "content": reply})
     return 0

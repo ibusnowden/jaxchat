@@ -20,8 +20,16 @@ def token_bigram_hash(
 ) -> jax.Array:
     """Compute bigram hash embedding indices.
 
-    For each position i (except the last), hash(token_i, token_{i+1}) maps to a
-    bucket.  The last token gets bucket 0 (no bigram info).
+    For each position i (except the first), hash(token_{i-1}, token_i) maps to
+    a bucket.  The first token gets bucket 0 (no bigram info).
+
+    CAUSALITY NOTE: position i must only see tokens <= i.  The pre-2026-06-12
+    version paired (token_i, token_{i+1}) and padded at the END, which leaked
+    the NEXT token into position i's input embedding — a label leak that
+    inflated every teacher-forced metric (val_bpb, CORE) of bigram-enabled
+    runs and made autoregressive generation collapse (at the generating
+    position the "next token" is padding).  Checkpoints trained before the
+    fix expect the leaky feature and are invalid either way.
 
     Args:
         idx: token IDs, shape (..., seq_len)
@@ -36,14 +44,14 @@ def token_bigram_hash(
     seq_len = idx.shape[-1]
     flat_idx = idx.reshape(-1, seq_len)
 
-    # Compute pairs: [token_i, token_{i+1}]
+    # Compute pairs: [token_{i-1}, token_i]
     pairs = jnp.stack([flat_idx[:, :-1], flat_idx[:, 1:]], axis=-1)  # (B, S-1, 2)
 
     # Look up bucket from precomputed table
     buckets = bigram_bucket[pairs[..., 0], pairs[..., 1]]  # (B, S-1)
 
-    # Pad with 0 for the last position
-    padded = jnp.pad(buckets, ((0, 0), (0, 1)), mode="constant", constant_values=0)
+    # Pad with 0 for the FIRST position (no preceding token).
+    padded = jnp.pad(buckets, ((0, 0), (1, 0)), mode="constant", constant_values=0)
     return padded.reshape(*batch_shape, seq_len).astype(jnp.int32)
 
 

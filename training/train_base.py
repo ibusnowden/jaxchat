@@ -35,7 +35,7 @@ import jax
 import jax.numpy as jnp
 from jax import jit
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
-from jax.tree_util import tree_map
+from jax.tree_util import tree_flatten_with_path, tree_map
 
 from jaxchat import checkpoint as ckpt_lib
 from jaxchat import wandb_log as wb
@@ -62,11 +62,68 @@ from jaxchat.model import (
     train_step,
     maybe_untie_weights,
 )
+from jaxchat.optimizer import get_lr_scale
 from jaxchat.schedules import get_shape_for_step
 
 
 def _hours_for_throughput(total_tokens: int, tok_s: float) -> float:
     return float(total_tokens) / max(tok_s, 1.0) / 3600.0
+
+
+def _reported_param_count(breakdown: dict[str, int]) -> int:
+    return int(breakdown.get("total", 0) - breakdown.get("scalars", 0))
+
+
+def _estimated_flops_per_token_for_report(config: Config, breakdown: dict[str, int]) -> float:
+    # Match the nanochat-style accounting used by the target report: dense params
+    # plus the token-feature table if the architecture excludes it from params.
+    param_count = _reported_param_count(breakdown)
+    if not config.bigram_hash_embed and config.vocab_size == 65_536 and config.depth == 20:
+        param_count += int(config.bigram_hash_buckets * config.d_model)
+    return 6.0 * float(param_count)
+
+
+def log_nanochat_style_startup(config: Config, breakdown: dict[str, int], logger: Logger) -> None:
+    seq_len = int(config.max_seq_len)
+    global_batch = int(config.tokens_per_step // max(seq_len, 1))
+    per_rank_batch = max(global_batch // max(jax.device_count(), 1), 1)
+    grad_accum = max(global_batch // max(config.micro_batch_size, 1), 1)
+    reported_params = _reported_param_count(breakdown)
+    flops_per_token = _estimated_flops_per_token_for_report(config, breakdown)
+    total_flops = flops_per_token * float(config.actual_train_tokens)
+    ratio = float(config.actual_train_tokens) / max(float(reported_params), 1.0)
+    lr_scale = 1.0 / (float(config.d_model) / 768.0) ** 0.5
+
+    for line in (
+        f"Vocab size: {config.vocab_size:,}",
+        f"num_layers: {config.depth}",
+        f"model_dim: {config.d_model}",
+        f"num_heads: {config.n_heads}",
+        f"num_kv_heads: {config.n_kv_heads}",
+        f"Tokens / micro-batch / rank: {per_rank_batch} x {seq_len} = {per_rank_batch * seq_len:,}",
+        f"Tokens / micro-batch: {config.tokens_per_step:,}",
+        f"Total batch size {config.tokens_per_step:,} => gradient accumulation steps: {grad_accum}",
+        f"Number of parameters: {reported_params:,}",
+        f"Estimated FLOPs per token: {flops_per_token:.6e}",
+        f"Calculated number of iterations from target data:param ratio: {config.n_train_iters:,}",
+        f"Total number of training tokens: {config.actual_train_tokens:,}",
+        f"Tokens : Params ratio: {ratio:.2f}",
+        f"Total training FLOPs estimate: {total_flops:.6e}",
+        f"Scaling the LR for the AdamW parameters ∝1/√({config.d_model}/768) = {lr_scale:.6f}",
+    ):
+        logger.msg(line)
+
+
+def log_muon_group_summary(params: Pytree, logger: Logger) -> None:
+    groups: dict[tuple[int, ...], int] = {}
+    for path, leaf in tree_flatten_with_path(params)[0]:
+        names = model_lib.path_to_names(path)
+        if names and names[0] in {"wte", "lm_head", "value_embeds", "resid_lambdas", "x0_lambdas", "skip_lambdas"}:
+            continue
+        if getattr(leaf, "ndim", 0) == 2:
+            groups[tuple(int(x) for x in leaf.shape)] = groups.get(tuple(int(x) for x in leaf.shape), 0) + 1
+    for shape, count in sorted(groups.items()):
+        logger.msg(f"Muon: Grouping {count} params of shape torch.Size({list(shape)})")
 
 
 def run_evaluation(
@@ -100,6 +157,7 @@ def run_evaluation(
     final_bpb = bpb_accum / val_steps
     logger.log({"step": step, "val_bpb": final_bpb})
     wb.wandb_log({"step": step, "val_bpb": final_bpb})
+    logger.msg(f"Step {step:05d} | Validation bpb: {final_bpb:.4f}")
     logger.msg(f"Validation finished for step {step}. BPB: {final_bpb:.4f}")
     return time.perf_counter() - eval_start
 
@@ -240,6 +298,8 @@ def train_loop(
             f"optimizer: {config.optimizer}"
         )
         logger.msg(f"Param breakdown: {format_parameter_breakdown(actual_breakdown)}")
+        log_nanochat_style_startup(config, actual_breakdown, logger)
+        log_muon_group_summary(params, logger)
         _embed = actual_breakdown.get("wte", 0) + actual_breakdown.get("lm_head", 0) + actual_breakdown.get("value_embeds", 0)
         _nonembed = max(param_count - _embed, 1)
         _xfmr = max(actual_breakdown.get("transformer_matrices", _nonembed), 1)
@@ -340,8 +400,21 @@ def train_loop(
 
         eval_s_total = 0.0
         checkpoint_s_in_loop = 0.0
+        if config.eval_at_start and start_step == 0:
+            run_evaluation(
+                0,
+                config,
+                params,
+                val_loader,
+                precomputed_params,
+                token_bytes,
+                logger,
+                compiled_eval_fn,
+            )
+            logger.flush()
         logger.msg("Starting training...")
         train_loop_start = time.perf_counter()
+        last_step_time = train_loop_start
 
         def _save_base(step_idx: int) -> str:
             return ckpt_lib.save(
@@ -386,10 +459,30 @@ def train_loop(
                 batched_y,
             )
 
-            if step % 10 == 9:
+            now = time.perf_counter()
+            dt = now - last_step_time
+            last_step_time = now
+            if config.log_every > 0 and (step % config.log_every == 0 or step == config.n_train_iters - 1):
                 metrics_view = {k: float(v) for k, v in metrics.items()}
-                logger.log({"step": step, "time": datetime.datetime.now()} | metrics_view)
-                wb.wandb_log({"step": step, **metrics_view})
+                lr_multiplier = float(get_lr_scale(
+                    jnp.asarray(step, dtype=jnp.int32),
+                    config.n_warmup_iters,
+                    config.n_warmdown_iters,
+                    config.n_train_iters,
+                    config.lr_schedule,
+                ))
+                tok_s = float(config.tokens_per_step) / max(dt, 1e-9)
+                mfu = estimate_mfu_proxy(param_count, config, dt) * 100.0
+                elapsed_m = (now - train_loop_start) / 60.0
+                percent = 100.0 * float(step) / max(float(config.n_train_iters), 1.0)
+                logger.msg(
+                    f"step {step:05d}/{config.n_train_iters} ({percent:.2f}%) | "
+                    f"loss: {metrics_view.get('loss', float('nan')):.6f} | "
+                    f"lrm: {lr_multiplier:.2f} | dt: {dt * 1000.0:.2f}ms | "
+                    f"tok/sec: {tok_s:,.0f} | mfu: {mfu:.2f} | total time: {elapsed_m:.2f}m"
+                )
+                wb.wandb_log({"step": step, "lrm": lr_multiplier, "dt_ms": dt * 1000.0,
+                              "tok_s": tok_s, "mfu": mfu, "elapsed_m": elapsed_m, **metrics_view})
             if step > 0 and step % config.val_loss_every == 0:
                 eval_s_total += run_evaluation(
                     step,

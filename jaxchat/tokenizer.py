@@ -38,12 +38,19 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_FINEWEB_TOKENIZER_DIR = os.path.join(PROJECT_ROOT, "data", "fineweb32k")
 DEFAULT_FINEWEB_TOKENIZER_DATASETS = ("HuggingFaceFW/fineweb-edu", "HuggingFaceFW/fineweb")
 DEFAULT_FINEWEB_VOCAB_SIZE = 32768
+DEFAULT_RUST65K_TOKENIZER_DIR = os.path.join(PROJECT_ROOT, "data", "fineweb65k", "tokenizer")
 
 
 def resolve_tokenizer_json_path(tokenizer_path_or_dir: str) -> str:
     if tokenizer_path_or_dir.endswith(".json"):
         return tokenizer_path_or_dir
     return os.path.join(tokenizer_path_or_dir, "tokenizer.json")
+
+
+def resolve_tokenizer_pkl_path(tokenizer_path_or_dir: str) -> str:
+    if tokenizer_path_or_dir.endswith(".pkl"):
+        return tokenizer_path_or_dir
+    return os.path.join(tokenizer_path_or_dir, "tokenizer.pkl")
 
 
 def _tokenizer_json_candidates(tokenizer_path_or_dir: str) -> tuple[str, ...]:
@@ -61,6 +68,28 @@ def _find_existing_tokenizer_json(tokenizer_path_or_dir: str) -> str | None:
         if os.path.exists(candidate):
             return candidate
     return None
+
+
+def _tokenizer_pkl_candidates(tokenizer_path_or_dir: str) -> tuple[str, ...]:
+    tokenizer_pkl = resolve_tokenizer_pkl_path(tokenizer_path_or_dir)
+    candidates = [tokenizer_pkl]
+    if not os.path.isabs(tokenizer_pkl):
+        repo_relative = os.path.join(PROJECT_ROOT, tokenizer_pkl)
+        if repo_relative not in candidates:
+            candidates.append(repo_relative)
+    return tuple(candidates)
+
+
+def _find_existing_tokenizer_pkl(tokenizer_path_or_dir: str) -> str | None:
+    for candidate in _tokenizer_pkl_candidates(tokenizer_path_or_dir):
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def find_existing_tokenizer_path(tokenizer_path_or_dir: str) -> str | None:
+    """Return an existing tokenizer artifact path, preferring HF JSON over Rust pickle."""
+    return _find_existing_tokenizer_json(tokenizer_path_or_dir) or _find_existing_tokenizer_pkl(tokenizer_path_or_dir)
 
 
 def normalize_dataset_specs(
@@ -394,6 +423,18 @@ def load_hf_tokenizer(tokenizer_path_or_dir: str):
     return HuggingFaceTokenizer.from_file(tokenizer_json)
 
 
+def load_tokenizer(tokenizer_path_or_dir: str):
+    """Load either a HuggingFace ``tokenizer.json`` or RustBPE ``tokenizer.pkl`` artifact."""
+    tokenizer_json = _find_existing_tokenizer_json(tokenizer_path_or_dir)
+    if tokenizer_json is not None:
+        return HuggingFaceTokenizer.from_file(tokenizer_json)
+    tokenizer_pkl = _find_existing_tokenizer_pkl(tokenizer_path_or_dir)
+    if tokenizer_pkl is not None:
+        return RustBPETokenizer.from_directory(os.path.dirname(tokenizer_pkl) or ".")
+    checked = _tokenizer_json_candidates(tokenizer_path_or_dir) + _tokenizer_pkl_candidates(tokenizer_path_or_dir)
+    raise FileNotFoundError("Tokenizer not found at " + " or ".join(checked))
+
+
 def ensure_hf_tokenizer(
     tokenizer_path_or_dir: str,
     *,
@@ -414,6 +455,91 @@ def ensure_hf_tokenizer(
     tokenizer_dir = os.path.dirname(tokenizer_json) or "."
     print(
         f"Training new {vocab_size}-token tokenizer at {tokenizer_json} "
+        f"from {normalize_dataset_specs(dataset_names, dataset_configs)}"
+    )
+    return train_hf_tokenizer_from_dataset(
+        tokenizer_dir=tokenizer_dir,
+        dataset_names=dataset_names,
+        dataset_configs=dataset_configs,
+        split=split,
+        text_field=text_field,
+        vocab_size=vocab_size,
+        max_documents=max_documents,
+    )
+
+
+def train_rust_tokenizer_from_dataset(
+    *,
+    tokenizer_dir: str,
+    dataset_names: str | Sequence[str],
+    dataset_configs: str | Sequence[str | None] | None = None,
+    split: str = "train",
+    text_field: str = "text",
+    vocab_size: int = 65536,
+    max_documents: int | None = None,
+):
+    text_iter = iter_hf_dataset_text(
+        dataset_names,
+        dataset_configs=dataset_configs,
+        split=split,
+        text_field=text_field,
+        max_documents=max_documents,
+    )
+    tokenizer = RustBPETokenizer.train_from_iterator(text_iter, vocab_size=vocab_size)
+    tokenizer.save(tokenizer_dir)
+    return tokenizer
+
+
+def ensure_tokenizer(
+    tokenizer_path_or_dir: str,
+    *,
+    impl: str = "auto",
+    train_if_missing: bool = False,
+    dataset_names: str | Sequence[str] = DEFAULT_FINEWEB_TOKENIZER_DATASETS,
+    dataset_configs: str | Sequence[str | None] | None = None,
+    split: str = "train",
+    text_field: str = "text",
+    vocab_size: int = DEFAULT_FINEWEB_VOCAB_SIZE,
+    max_documents: int | None = None,
+):
+    """Load or train a tokenizer using ``impl`` = auto|hf|rust."""
+    if impl not in {"auto", "hf", "rust"}:
+        raise ValueError(f"Unknown tokenizer impl {impl!r}; expected auto|hf|rust.")
+    if impl in {"auto", "hf"}:
+        existing_json = _find_existing_tokenizer_json(tokenizer_path_or_dir)
+        if existing_json is not None:
+            return HuggingFaceTokenizer.from_file(existing_json)
+    if impl in {"auto", "rust"}:
+        existing_pkl = _find_existing_tokenizer_pkl(tokenizer_path_or_dir)
+        if existing_pkl is not None:
+            return RustBPETokenizer.from_directory(os.path.dirname(existing_pkl) or ".")
+    if not train_if_missing:
+        checked = _tokenizer_json_candidates(tokenizer_path_or_dir) + _tokenizer_pkl_candidates(tokenizer_path_or_dir)
+        raise FileNotFoundError("Tokenizer not found at " + " or ".join(checked))
+    if impl == "auto":
+        impl = "rust" if vocab_size >= 65536 else "hf"
+    if impl == "rust":
+        tokenizer_dir = (
+            os.path.dirname(resolve_tokenizer_pkl_path(tokenizer_path_or_dir))
+            if tokenizer_path_or_dir.endswith(".pkl")
+            else tokenizer_path_or_dir
+        )
+        print(
+            f"Training new RustBPE {vocab_size}-token tokenizer at {resolve_tokenizer_pkl_path(tokenizer_dir)} "
+            f"from {normalize_dataset_specs(dataset_names, dataset_configs)}"
+        )
+        return train_rust_tokenizer_from_dataset(
+            tokenizer_dir=tokenizer_dir,
+            dataset_names=dataset_names,
+            dataset_configs=dataset_configs,
+            split=split,
+            text_field=text_field,
+            vocab_size=vocab_size,
+            max_documents=max_documents,
+        )
+    tokenizer_dir = os.path.dirname(resolve_tokenizer_json_path(tokenizer_path_or_dir)) or "."
+    print(
+        f"Training new HuggingFace {vocab_size}-token tokenizer at {resolve_tokenizer_json_path(tokenizer_dir)} "
         f"from {normalize_dataset_specs(dataset_names, dataset_configs)}"
     )
     return train_hf_tokenizer_from_dataset(
@@ -582,7 +708,7 @@ def get_token_bytes(device="cpu"):
 
 def main(argv: Sequence[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
-    parser = argparse.ArgumentParser(description="Train the 32k FineWeb tokenizer used by jaxchat.")
+    parser = argparse.ArgumentParser(description="Train the FineWeb tokenizer used by jaxchat.")
     parser.add_argument(
         "--dataset-name",
         default=",".join(DEFAULT_FINEWEB_TOKENIZER_DATASETS),
@@ -596,25 +722,42 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--split", default="train")
     parser.add_argument("--text-field", default="text")
     parser.add_argument("--tokenizer-dir", default=DEFAULT_FINEWEB_TOKENIZER_DIR)
+    parser.add_argument("--impl", choices=("hf", "rust"), default="hf",
+                        help="Tokenizer trainer implementation. Use rust for the 65K target.")
     parser.add_argument("--vocab-size", type=int, default=DEFAULT_FINEWEB_VOCAB_SIZE)
     parser.add_argument("--max-documents", type=int, default=None)
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args(argv)
 
-    tokenizer_json = resolve_tokenizer_json_path(args.tokenizer_dir)
-    if os.path.exists(tokenizer_json) and not args.overwrite:
-        print(f"Tokenizer already exists at {tokenizer_json}; pass --overwrite to retrain.")
+    artifact_path = (
+        resolve_tokenizer_pkl_path(args.tokenizer_dir)
+        if args.impl == "rust"
+        else resolve_tokenizer_json_path(args.tokenizer_dir)
+    )
+    if os.path.exists(artifact_path) and not args.overwrite:
+        print(f"Tokenizer already exists at {artifact_path}; pass --overwrite to retrain.")
         return 0
 
-    train_hf_tokenizer_from_dataset(
-        tokenizer_dir=os.path.dirname(tokenizer_json) or ".",
-        dataset_names=args.dataset_name,
-        dataset_configs=args.dataset_config,
-        split=args.split,
-        text_field=args.text_field,
-        vocab_size=args.vocab_size,
-        max_documents=args.max_documents,
-    )
+    if args.impl == "rust":
+        train_rust_tokenizer_from_dataset(
+            tokenizer_dir=os.path.dirname(artifact_path) or ".",
+            dataset_names=args.dataset_name,
+            dataset_configs=args.dataset_config,
+            split=args.split,
+            text_field=args.text_field,
+            vocab_size=args.vocab_size,
+            max_documents=args.max_documents,
+        )
+    else:
+        train_hf_tokenizer_from_dataset(
+            tokenizer_dir=os.path.dirname(artifact_path) or ".",
+            dataset_names=args.dataset_name,
+            dataset_configs=args.dataset_config,
+            split=args.split,
+            text_field=args.text_field,
+            vocab_size=args.vocab_size,
+            max_documents=args.max_documents,
+        )
     return 0
 
 

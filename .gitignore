@@ -15,8 +15,13 @@ __pycache__/
 *.pyo
 .venv/
 
-# data
-data/
+# data caches/run outputs — but keep the data-pipeline source files
+data/*
+!data/*.py
 
 # uv
 uv.lock
+
+# local reference images / scratch
+docs/refs/
+plot.png

@@ -10,7 +10,7 @@ Notes:
       can be reused across prompt lengths.  That is fast enough for the d4
       (~11M-param) target on a single H100 and avoids the complexity of a
       cache layout that would couple to the attention dispatcher in fa3.py.
-    - Tokenizer is loaded via :func:`jaxchat.tokenizer.load_hf_tokenizer`.
+    - Tokenizer is loaded via :func:`jaxchat.tokenizer.load_tokenizer`.
 """
 
 from __future__ import annotations
@@ -25,15 +25,17 @@ import numpy as np
 from jax import jit
 from jax.tree_util import tree_map
 
+from jax.sharding import NamedSharding, PartitionSpec as P
+
 from jaxchat import checkpoint as ckpt_lib
 from jaxchat.model import (
-    get_data_parallel_sharding,
     get_mesh,
     get_weight_sharding,
     gpt_forward,
     precompute_rope,
 )
-from jaxchat.tokenizer import load_hf_tokenizer
+from jaxchat.tokenizer import load_tokenizer
+from jaxchat.tools import execute_python
 
 
 def _logits_at(params, precomputed_params, config, embedding_out_sharding, idx_padded, pos):
@@ -107,33 +109,97 @@ class Engine:
             _logprobs_full,
             static_argnames=("config", "embedding_out_sharding"),
         )
+        self._n_params = None  # lazily computed by model_info()
+
+    def model_info(self) -> dict:
+        """Return a JSON-serializable summary of the loaded model for UI/servers."""
+        c = self.config
+
+        def g(name, default=None):
+            return getattr(c, name, default)
+
+        if self._n_params is None:
+            try:
+                self._n_params = int(
+                    sum(int(np.prod(leaf.shape)) for leaf in jax.tree_util.tree_leaves(self.params))
+                )
+            except Exception:
+                self._n_params = 0
+
+        def _fmt_params(n: int) -> str:
+            for unit, val in (("B", 1e9), ("M", 1e6), ("K", 1e3)):
+                if n >= val:
+                    return f"{n / val:.2f}{unit}"
+            return str(n)
+
+        return {
+            "stage": self.stage,
+            "step": int(self.step),
+            "n_params": self._n_params,
+            "n_params_human": _fmt_params(self._n_params),
+            "depth": g("depth"),
+            "n_layers": g("n_layers"),
+            "d_model": g("d_model"),
+            "n_heads": g("n_heads"),
+            "n_kv_heads": g("n_kv_heads"),
+            "n_recurrence": g("n_recurrence"),
+            "vocab_size": g("vocab_size"),
+            "max_seq_len": g("max_seq_len"),
+            "tokenizer_name": g("tokenizer_name"),
+            "logit_softcap": g("logit_softcap"),
+            "dtype": str(g("dtype")),
+        }
 
     @classmethod
-    def from_run_dir(cls, run_dir: str, *, stage: str | None = None, tokenizer_path: str | None = None) -> "Engine":
+    def from_run_dir(
+        cls,
+        run_dir: str,
+        *,
+        stage: str | None = None,
+        tokenizer_path: str | None = None,
+        single_device: bool = False,
+    ) -> "Engine":
         state = ckpt_lib.load_latest(run_dir, stage=stage)
-        return cls.from_state(state, tokenizer_path=tokenizer_path)
+        return cls.from_state(state, tokenizer_path=tokenizer_path, single_device=single_device)
 
     @classmethod
-    def from_path(cls, ckpt_path: str, *, tokenizer_path: str | None = None) -> "Engine":
+    def from_path(
+        cls, ckpt_path: str, *, tokenizer_path: str | None = None, single_device: bool = False
+    ) -> "Engine":
         state = ckpt_lib.load_path(ckpt_path)
-        return cls.from_state(state, tokenizer_path=tokenizer_path)
+        return cls.from_state(state, tokenizer_path=tokenizer_path, single_device=single_device)
 
     @classmethod
-    def from_state(cls, state: dict, *, tokenizer_path: str | None = None) -> "Engine":
+    def from_state(
+        cls, state: dict, *, tokenizer_path: str | None = None, single_device: bool = False
+    ) -> "Engine":
         config = state["config"]
+        if single_device:
+            # Collapse any data-parallel mesh to a single-device mesh (one device
+            # per axis) so a checkpoint trained across N GPUs can be served for
+            # inference on one device (a single GPU, or CPU). We keep the axis
+            # names so any sharding spec that references them still resolves; with
+            # one device per axis every sharding degenerates to replicated.
+            new_shape = tuple(1 for _ in config.mesh_shape) if config.mesh_shape else (1,)
+            new_names = config.mesh_axis_names if config.mesh_axis_names else ("dp",)
+            config = dataclasses.replace(config, mesh_shape=new_shape, mesh_axis_names=new_names)
         mesh = get_mesh(config)
         weight_sharding = get_weight_sharding(config, mesh)
         params = tree_map(lambda leaf: jax.device_put(jnp.asarray(leaf), weight_sharding), state["params"])
         with mesh:
             precomputed_params = precompute_rope(config, mesh)
-        embedding_out_sharding = get_data_parallel_sharding(config, mesh, ndim=3)
+        # Match train_base / eval_base: the embedding/output activations use
+        # ``config.activation_sharding`` (replicated batch for the 124m presets)
+        # so single-sample inference works on multi-GPU meshes where batch=1
+        # would not divide ``dp``.
+        embedding_out_sharding = NamedSharding(mesh, P(*config.activation_sharding))
         tok_path = tokenizer_path or state.get("tokenizer_path") or config.tokenizer_json
         if not tok_path:
             raise RuntimeError(
                 "No tokenizer_path on checkpoint and config.tokenizer_json is empty; "
                 "pass tokenizer_path= explicitly."
             )
-        tokenizer = load_hf_tokenizer(tok_path)
+        tokenizer = load_tokenizer(tok_path)
         return cls(
             params=params,
             precomputed_params=precomputed_params,
@@ -166,6 +232,26 @@ class Engine:
                 n - 1,
             )
         return np.asarray(jax.device_get(logits))
+
+    def prefill_ids(self, prompt_ids: list[int]) -> dict:
+        """Create a decode cache object.
+
+        The current cache stores token ids and preserves the future KV-cache API
+        shape. Attention KV tensors can be added behind this interface without
+        changing callers.
+        """
+        return {"ids": list(prompt_ids)}
+
+    def decode_one(self, cache: dict, *, temperature: float = 0.8, top_k: int | None = 40,
+                   top_p: float | None = None, seed: int = 0) -> tuple[int, dict]:
+        rng = np.random.default_rng(seed)
+        ids = list(cache.get("ids", []))
+        logits = self._next_token_logits(ids)
+        logits = _apply_temperature(logits, temperature)
+        logits = _top_k_top_p_filter(logits, top_k, top_p)
+        tok = _sample(rng, logits)
+        ids.append(tok)
+        return tok, {"ids": ids}
 
     def generate_ids(
         self,
@@ -247,9 +333,99 @@ class Engine:
             seed=seed,
             stop_token_ids=stop_ids,
         )
-        if gen_ids and gen_ids[-1] == end_id:
+        # Strip any trailing stop token (assistant_end or bos) — generate_ids
+        # appends the stop token before breaking, and special tokens decode to
+        # their literal "<|...|>" surface form (skip_special_tokens=False),
+        # which would otherwise leak into the rendered reply.
+        if gen_ids and gen_ids[-1] in stop_ids:
             gen_ids = gen_ids[:-1]
         return self.tokenizer.decode(gen_ids)
+
+    def chat_stream(
+        self,
+        messages: list[dict],
+        *,
+        max_new_tokens: int = 256,
+        temperature: float = 0.7,
+        top_k: int | None = 50,
+        top_p: float | None = 0.95,
+        seed: int = 0,
+    ):
+        """Yield decoded text deltas for ``messages`` one token at a time.
+
+        Mirrors :meth:`chat` semantics (render_for_completion priming, stop on
+        ``<|assistant_end|>``/BOS) but streams the reply instead of returning it
+        whole. Decodes the accumulated continuation each step so BPE merges across
+        token boundaries are handled correctly; yields only the new suffix.
+        """
+        if not messages or messages[-1]["role"] != "user":
+            raise ValueError("chat_stream() expects messages to end with a user turn.")
+        primed = {"messages": messages + [{"role": "assistant", "content": ""}]}
+        prompt_ids = self.tokenizer.render_for_completion(primed)
+        end_id = self.tokenizer.encode_special("<|assistant_end|>")
+        bos_id = self.tokenizer.get_bos_token_id()
+        stop_ids = {tid for tid in (end_id, bos_id) if tid is not None}
+
+        rng = np.random.default_rng(seed)
+        ids = list(prompt_ids)
+        gen_ids: list[int] = []
+        decoded_prev = ""
+        for _ in range(max_new_tokens):
+            if len(ids) >= self.config.max_seq_len:
+                break
+            logits = self._next_token_logits(ids)
+            logits = _apply_temperature(logits, temperature)
+            logits = _top_k_top_p_filter(logits, top_k, top_p)
+            tok = _sample(rng, logits)
+            ids.append(tok)
+            if tok in stop_ids:
+                break
+            gen_ids.append(tok)
+            text = self.tokenizer.decode(gen_ids)
+            if len(text) > len(decoded_prev):
+                yield text[len(decoded_prev):]
+                decoded_prev = text
+
+    def chat_with_tools(
+        self,
+        messages: list[dict],
+        *,
+        max_new_tokens: int = 256,
+        temperature: float = 0.7,
+        top_k: int | None = 50,
+        top_p: float | None = 0.95,
+        seed: int = 0,
+        max_tool_rounds: int = 2,
+        tool_timeout_s: float = 2.0,
+    ) -> dict:
+        """Chat and execute local Python tool calls emitted with special tokens."""
+        working = list(messages)
+        events: list[dict] = []
+        reply = ""
+        for round_idx in range(max(max_tool_rounds, 0) + 1):
+            reply = self.chat(
+                working,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                seed=seed + round_idx,
+            )
+            start = reply.find("<|python_start|>")
+            end = reply.find("<|python_end|>", start + 1)
+            if start < 0 or end < 0:
+                return {"reply": reply, "events": events}
+            code = reply[start + len("<|python_start|>"):end].strip()
+            result = execute_python(code, timeout_s=tool_timeout_s)
+            events.append({"type": "python", "code": code, **result})
+            tool_augmented = (
+                reply[: end + len("<|python_end|>")]
+                + "<|output_start|>"
+                + result["output"]
+                + "<|output_end|>"
+            )
+            working = working + [{"role": "assistant", "content": tool_augmented}]
+        return {"reply": reply, "events": events}
 
     def score_continuation(self, ctx_ids: list[int], cont_ids: list[int]) -> float:
         """Sum log-probs of ``cont_ids`` conditioned on ``ctx_ids`` (natural log).

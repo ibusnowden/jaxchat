@@ -14,21 +14,29 @@ from jaxchat.model import Config
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# 32k-BPE FineWeb assets.  ``fineweb32k_real`` holds shards that were tokenized with
-# the 32k tokenizer (see ``data/retokenize_bins.py``).  The older ``fineweb32k`` dir was
-# a symlink to GPT-2-tokenized shards (vocab 50257) -- feeding those into a 32k-vocab
-# model silently corrupts the embedding gather and labels, i.e. immediate loss=nan.
-# Prefer the re-tokenized shards when present; fall back to the legacy dir otherwise.
+# 32k-BPE FineWeb assets.  ``fineweb32k_real_29`` holds the extended re-tokenized
+# pool (~2.94B train / 101M val tokens, retokenized from 29 GPT-2 source shards).
+# ``fineweb32k_real`` is the original 9-shard re-tokenization (~912M train).  The
+# legacy ``fineweb32k`` dir is a symlink to GPT-2-tokenized shards (vocab 50257) --
+# feeding those into a 32k-vocab model silently corrupts the embedding gather and
+# labels, i.e. immediate loss=nan.  Prefer the largest available real dir.
+_FINEWEB_32K_REAL_29_DIR = os.path.join(PROJECT_ROOT, "data", "fineweb32k_real_29")
 _FINEWEB_32K_REAL_DIR = os.path.join(PROJECT_ROOT, "data", "fineweb32k_real")
 _FINEWEB_32K_LEGACY_DIR = os.path.join(PROJECT_ROOT, "data", "fineweb32k")
-FINEWEB_32K_DIR = (
-    _FINEWEB_32K_REAL_DIR
-    if os.path.isfile(os.path.join(_FINEWEB_32K_REAL_DIR, "fineweb_val_000000.bin"))
-    else _FINEWEB_32K_LEGACY_DIR
-)
+if os.path.isfile(os.path.join(_FINEWEB_32K_REAL_29_DIR, "fineweb_val_000000.bin")):
+    FINEWEB_32K_DIR = _FINEWEB_32K_REAL_29_DIR
+elif os.path.isfile(os.path.join(_FINEWEB_32K_REAL_DIR, "fineweb_val_000000.bin")):
+    FINEWEB_32K_DIR = _FINEWEB_32K_REAL_DIR
+else:
+    FINEWEB_32K_DIR = _FINEWEB_32K_LEGACY_DIR
 FINEWEB_TRAIN_GLOB = os.path.join(FINEWEB_32K_DIR, "fineweb_train_*.bin")
 FINEWEB_VAL_BIN = os.path.join(FINEWEB_32K_DIR, "fineweb_val_000000.bin")
 FINEWEB_TOKENIZER_JSON = os.path.join(FINEWEB_32K_DIR, "tokenizer.json")
+
+FINEWEB_65K_DIR = os.path.join(PROJECT_ROOT, "data", "fineweb65k")
+FINEWEB_65K_TOKENIZER = os.path.join(FINEWEB_65K_DIR, "tokenizer", "tokenizer.pkl")
+FINEWEB_65K_TRAIN_GLOB = os.path.join(FINEWEB_65K_DIR, "fineweb_train_*.bin")
+FINEWEB_65K_VAL_BIN = os.path.join(FINEWEB_65K_DIR, "fineweb_val_000000.bin")
 
 # Single-H100 d4 assets.  Tokenizer/data are produced by the d4 speedrun.
 FINEWEB_8K_DIR = os.path.join(PROJECT_ROOT, "data", "fineweb8k")
@@ -153,7 +161,48 @@ PRESET_124M_MODERN = _124m_modern
 # but only ~23M of trainable transformer matrices, and a token budget sized off that
 # small number — i.e. the net is FLOP-cheap and param-bottlenecked, exactly where adding
 # recurrence (free compute per param) should pay.  Same data/budget as 124m-modern.
+# RESULT: loses by 0.0152 BPB at 1.31B tokens vs the non-looped baseline — kept for
+# reference but not recommended. See ablation_notes.md #10.
 PRESET_124M_LOOP = dataclasses.replace(_124m_modern, n_recurrence=2)
+
+# 188m-modern: depth=12 modern (Config auto-scales d_model = depth*64 ⇒ d_model=768,
+# n_heads=6, head_dim=128).  Param breakdown at vocab=32768: wte 25.2M, value_embeds
+# 50.3M (n_value_layers=2), lm_head 25.2M, transformer_matrices 75.5M, +12.6M bigram
+# hash table ⇒ ~188M total (53% embedding, 75M of "real" transformer matrices — 3.3×
+# the depth-8 net's 23M).  Best result so far on this preset family: val_bpb 0.8275
+# at 1.31B tokens (vs 0.8878 for 124m-modern at the same budget, 0.8871 for
+# 124m-modern at 2.1B).  ~2.74 s/step on 8×RTX 6000.  See ablation_notes.md #11.
+PRESET_188M_MODERN = dataclasses.replace(_124m_modern, depth=12)
+
+PRESET_0P56B_RUST65K = dataclasses.replace(
+    _124m_modern,
+    input_bin=FINEWEB_65K_TRAIN_GLOB,
+    input_val_bin=FINEWEB_65K_VAL_BIN,
+    tokenizer_json=FINEWEB_65K_TOKENIZER,
+    tokenizer_name="fineweb65k",
+    depth=20,
+    vocab_size=65_536,
+    n_kv_heads=10,
+    n_value_layers=0,
+    min_seq_len=2048,
+    max_seq_len=2048,
+    sequence_warmup_intervals=0,
+    tokens_per_step=524_288,
+    micro_batch_size=256,
+    train_token_ratio=20.0,
+    target_train_tokens=11_219_763_200,
+    n_train_iters=21_400,
+    n_warmup_iters=0,
+    val_loss_every=100,
+    val_tokens=524_288,
+    save_every=200,
+    log_every=1,
+    eval_at_start=True,
+    activation_sharding=(None, "dp", None),
+    use_long_short_attention=False,
+    bigram_hash_embed=False,
+    skip_connections=(),
+)
 
 
 PRESETS: dict[str, Config] = {
@@ -164,6 +213,8 @@ PRESETS: dict[str, Config] = {
     "124m": PRESET_124M,
     "124m-modern": PRESET_124M_MODERN,
     "124m-loop": PRESET_124M_LOOP,
+    "188m-modern": PRESET_188M_MODERN,
+    "0p56b-rust65k": PRESET_0P56B_RUST65K,
 }
 
 
@@ -174,12 +225,18 @@ __all__ = [
     "PRESET_124M",
     "PRESET_124M_MODERN",
     "PRESET_124M_LOOP",
+    "PRESET_188M_MODERN",
+    "PRESET_0P56B_RUST65K",
     "D4",
     "PRESETS",
     "FINEWEB_32K_DIR",
     "FINEWEB_TRAIN_GLOB",
     "FINEWEB_VAL_BIN",
     "FINEWEB_TOKENIZER_JSON",
+    "FINEWEB_65K_DIR",
+    "FINEWEB_65K_TOKENIZER",
+    "FINEWEB_65K_TRAIN_GLOB",
+    "FINEWEB_65K_VAL_BIN",
     "FINEWEB_8K_DIR",
     "FINEWEB_8K_TRAIN_GLOB",
     "FINEWEB_8K_VAL_BIN",

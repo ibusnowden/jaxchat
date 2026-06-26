@@ -61,12 +61,18 @@ def wandb_init(*, stage: str, run_name: str | None = None, config_dict: dict | N
 
         project = os.environ.get("WANDB_PROJECT", "jaxchat")
         entity = os.environ.get("WANDB_ENTITY") or None
-        name = run_name or f"{stage}-{_dt.datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        # WANDB_NAME / WANDB_RUN_GROUP env vars take precedence so sweep launchers
+        # (e.g. scripts/chinchilla_grid + runs/rtx_8gpu_chinchilla_isoflop.sh) can
+        # group and name runs without touching this file.
+        env_name = os.environ.get("WANDB_NAME")
+        env_group = os.environ.get("WANDB_RUN_GROUP")
+        name = env_name or run_name or f"{stage}-{_dt.datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        group = env_group or stage
         _RUN = wandb.init(
             project=project,
             entity=entity,
             name=name,
-            group=stage,
+            group=group,
             job_type=stage,
             config=config_dict or {},
             reinit=True,

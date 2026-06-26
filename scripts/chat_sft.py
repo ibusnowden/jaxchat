@@ -35,7 +35,6 @@ from jaxchat import wandb_log as wb  # noqa: E402
 from jaxchat.model import (  # noqa: E402
     Logger,
     count_parameters,
-    get_data_parallel_sharding,
     get_mesh,
     get_weight_sharding,
     init_optimizer,
@@ -43,7 +42,7 @@ from jaxchat.model import (  # noqa: E402
     precompute_rope,
     sft_train_step,
 )
-from jaxchat.tokenizer import load_hf_tokenizer  # noqa: E402
+from jaxchat.tokenizer import load_tokenizer  # noqa: E402
 
 
 def _load_jsonl(path: str) -> list[dict]:
@@ -99,6 +98,7 @@ def _batch_iter(rendered, *, batch_size: int, n_grad_accum: int, seed: int):
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Supervised fine-tune a jaxchat base checkpoint.")
     parser.add_argument("--base-run-dir", required=True)
+    parser.add_argument("--parent-stage", choices=("base", "sft"), default="base")
     parser.add_argument("--sft-data", required=True, help="JSONL with one {messages: [...]} per line.")
     parser.add_argument("--run-dir", required=True)
     parser.add_argument("--n-iters", type=int, default=200)
@@ -115,10 +115,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.smoke_iters is not None and args.smoke_iters > 0:
         args.n_iters = int(args.smoke_iters)
 
-    state = ckpt_lib.load_latest(args.base_run_dir, stage="base")
+    state = ckpt_lib.load_latest(args.base_run_dir, stage=args.parent_stage)
     base_config = state["config"]
     parent_meta = {
-        "stage": "base",
+        "stage": args.parent_stage,
         "ckpt_path": state.get("_checkpoint_path", ""),
         "step": int(state.get("step", 0)),
     }
@@ -164,7 +164,7 @@ def main(argv: list[str] | None = None) -> int:
     tok_path = args.tokenizer_json or state.get("tokenizer_path") or sft_config.tokenizer_json
     if not tok_path:
         raise RuntimeError("No tokenizer path found; pass --tokenizer-json.")
-    tokenizer = load_hf_tokenizer(tok_path)
+    tokenizer = load_tokenizer(tok_path)
 
     logger.msg(f"Loading SFT data from {args.sft_data}")
     rows = _load_jsonl(args.sft_data)
@@ -180,8 +180,11 @@ def main(argv: list[str] | None = None) -> int:
         param_count = count_parameters(params)
         logger.msg(f"SFT preset | params: {param_count:,} | tokens_per_step: {tokens_per_step:,} | iters: {args.n_iters}")
 
-        embedding_out_sharding = get_data_parallel_sharding(sft_config, mesh, ndim=3)
+        # Match train_base: embedding-output activations follow
+        # ``config.activation_sharding`` (replicated batch on the 124m presets)
+        # so micro_batch_size < dp doesn't trip a divisibility error.
         activation_sharding = NamedSharding(mesh, P(*sft_config.activation_sharding))
+        embedding_out_sharding = activation_sharding
 
         jitted = jit(
             sft_train_step,

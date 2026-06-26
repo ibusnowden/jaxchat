@@ -9,6 +9,7 @@ dependencies = [
     "orbax-checkpoint>=0.6.0",
     "tokenizers>=0.20.0",
     "tiktoken>=0.6.0",
+    "rustbpe>=0.1.0",
     "datasets>=2.18.0",
     "fastapi>=0.135.0",
     "uvicorn>=0.34.0",

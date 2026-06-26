@@ -29,13 +29,23 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--tools", action="store_true", help="Enable local Python tool execution loop.")
     parser.add_argument(
+        "--single-device",
+        action="store_true",
+        help="Collapse any data-parallel mesh to a single replicated device for inference.",
+    )
+    parser.add_argument(
         "--prompt",
         default=None,
         help="If given, run a single non-interactive turn and exit.",
     )
     args = parser.parse_args(argv)
 
-    engine = Engine.from_run_dir(args.run_dir, stage=args.stage, tokenizer_path=args.tokenizer_json)
+    engine = Engine.from_run_dir(
+        args.run_dir,
+        stage=args.stage,
+        tokenizer_path=args.tokenizer_json,
+        single_device=args.single_device,
+    )
     print(f"Loaded {engine.stage} stage @ step {engine.step}")
 
     if args.prompt is not None:

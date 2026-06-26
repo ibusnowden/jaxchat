@@ -38,6 +38,62 @@ on a single H100:
 
 Training loss drops from ~7.0 to ~3.8; validation BPB from ~2.3 to ~1.4.
 
+## Scaling: Chinchilla IsoFLOP sweep
+
+To pick model/data sizes we ran a Chinchilla-style IsoFLOP study (30 runs on
+8x RTX 6000 Ada): at each compute budget C ∈ {1e17, 3e17, 1e18, 1.5e18} FLOPs
+we trained a range of depths, fit a parabola in log10(N) to find the
+compute-optimal model size N\* per budget (with D\* = C / 6N\*), then fit
+power laws across budgets:
+
+> **N\* ∝ C^0.50  D\* ∝ C^0.50** — textbook Chinchilla
+> (Hoffmann et al. 2022 report 0.49/0.51).
+
+<p align="center">
+  <img src="assets/chinchilla_isoflop.png" alt="IsoFLOP curves and power-law fits" width="95%">
+</p>
+
+A depth miniseries (d10–d20, 137M→530M params, 1.31B tokens each on FineWeb)
+tracks loss and a 4-task CORE-style eval (ARC-E/C, HellaSwag, PIQA) across
+scale; depth 16 (327M) is the family's best val_bpb at 0.7626:
+
+<p align="center">
+  <img src="assets/miniseries_loss.png" alt="miniseries loss vs FLOPs" width="80%">
+</p>
+<p align="center">
+  <img src="assets/core_scaling.png" alt="CORE vs training FLOPs and time" width="95%">
+</p>
+
+Reproduce with `runs/rtx_8gpu_chinchilla_isoflop.sh` (sweep) and
+`scripts/fit_chinchilla.py` (fits + plots).
+
+## Results
+
+Beyond the `d4` speedrun, the same stack scales up. The largest run to date is a
+**0.5B** Chinchilla-optimal model (`124m-modern` preset at depth 20: d_model
+1280, vocab 32,768, seq 1024, 529.5M params), pretrained on ~5.0B tokens
+(Tokens:Params ≈ 9.5, from the IsoFLOP fit), then SFT'd:
+
+| Stage | val_bpb | CORE (mean acc, 4 tasks) | Notes |
+|-------|--------:|-------------------------:|-------|
+| Base (529.5M, ~5.0B tok) | **0.4786** | 0.360 | arc_e 0.330 · arc_c 0.247 · hellaswag 0.289 · piqa 0.574 |
+| + SFT (4k steps) | — | 0.364 | arc_e 0.349 · arc_c 0.254 · hellaswag 0.295 · piqa 0.556 |
+
+SFT also adds chat/instruction behavior; downstream generative evals at this
+scale are still ~0 (gsm8k, humaneval) and MMLU is near chance (0.265), as
+expected for a 0.5B base. CORE bits-per-byte here is on the 0.5B preset's own
+65k-vocab validation set and is **not** comparable to the 124m-family `val_bpb`
+(0.7626 at depth 16) — different tokenizer and val set.
+
+The GRPO/RL stage of the chain is memory-bound at this size: the loss
+materializes several full `(B, T, vocab)` logits-sized tensors at once — policy
+and reference logits plus their softmax/backward — which at depth 20 / vocab 32k
+/ batch `M*G` exceeded 34 GiB and OOM'd the first GRPO step. `scripts/chat_rl.py`
+keeps this in check by (1) cropping each batch to its actual sequence length
+(bucketed, mesh-divisible) instead of padding to `max_seq_len`, and (2) computing
+the frozen reference log-probs in a separate pass so only one logits tensor is
+live during the differentiated update.
+
 ## Layout
 
 ```

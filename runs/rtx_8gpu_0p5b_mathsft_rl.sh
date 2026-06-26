@@ -209,6 +209,15 @@ if [ "$RUN_FINAL_EVAL" = "1" ]; then
     || echo "(chat_eval skipped/partial)"
 fi
 
+if [ "${RUN_SANITY:-1}" = "1" ]; then
+  echo "=========================================="
+  echo "Generation sanity (Engine chat path) — math-SFT then final GRPO model"
+  echo "  Non-gating (|| true): training is done; this is the coherence report."
+  echo "=========================================="
+  $PY -m dev.gen_sanity_0p5b --run-dir "$MATHSFT_RUN" --stage sft --tokenizer-json "$TOKENIZER_JSON" || true
+  $PY -m dev.gen_sanity_0p5b --run-dir "$RL_RUN" --stage rl --tokenizer-json "$TOKENIZER_JSON" || true
+fi
+
 echo
 echo "=========================================="
 echo "0.5B math-SFT + shaped GRPO complete — $(date)"

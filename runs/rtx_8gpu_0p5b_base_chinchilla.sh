@@ -124,7 +124,18 @@ $PY -m scripts.base_eval \
   || echo "(base_eval skipped/partial)"
 
 echo "=========================================="
+echo "Base GENERATION SANITY (Engine path — the bigram-fix acceptance test)"
+echo "  base_eval above is TEACHER-FORCED and stayed healthy even WITH the leak;"
+echo "  only real sampling certifies the fix. A hard regression exits nonzero so"
+echo "  an afterok dependency halts the SFT/GRPO stages."
+echo "=========================================="
+$PY -m dev.gen_sanity_0p5b \
+  --run-dir "$BASE_RUN" \
+  --stage base \
+  --tokenizer-json "${DATA_DIR}/tokenizer.json"
+
+echo "=========================================="
 echo "✅ 0.5B Chinchilla base complete — $(date)"
 ls -lh "${BASE_RUN}/base/"state_step*.pkl 2>/dev/null | tail -1 || true
-echo "Chain SFT+RL:  sbatch --export=ALL,SKIP_BASE=1,BASE_RUN=${BASE_RUN} ${PROJECT_DIR}/runs/rtx_8gpu_0p5b_e2e.sh"
+echo "Chain SFT:  sbatch --dependency=afterok:\$SLURM_JOB_ID ${PROJECT_DIR}/runs/rtx_8gpu_0p5b_sft_smoltalk.sh"
 echo "=========================================="

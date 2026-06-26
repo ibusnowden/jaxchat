@@ -152,13 +152,29 @@ def _last_val_bpb_from_history(rows: list[dict]) -> Optional[float]:
     return None
 
 
+# Per-task chance baselines for the centered CORE score (DCLM / nanochat
+# definition): s_t = (acc_t - b_t) / (1 - b_t), averaged over tasks, so that
+# chance = 0 and a perfect model = 1.  piqa is binary; the rest are 4-way.
+TASK_CHANCE = {"piqa": 0.5, "arc_easy": 0.25, "arc_challenge": 0.25, "hellaswag": 0.25}
+
+
+def _centered_core(acc_by_task: dict) -> Optional[float]:
+    vals = []
+    for task, acc in acc_by_task.items():
+        b = TASK_CHANCE.get(task, 0.25)
+        vals.append((float(acc) - b) / (1.0 - b))
+    return sum(vals) / len(vals) if vals else None
+
+
 def _core_metrics(core: object) -> dict:
     if not isinstance(core, dict):
-        return {"accuracy": None, "stderr": None, "n": None, "task_count": None}
+        return {"accuracy": None, "stderr": None, "n": None, "task_count": None,
+                "centered": None}
 
     tasks = core.get("tasks") if isinstance(core.get("tasks"), dict) else core
     scored = []
-    for value in tasks.values():
+    acc_by_task: dict = {}
+    for name, value in tasks.items():
         if not isinstance(value, dict) or "accuracy" not in value:
             continue
         try:
@@ -168,6 +184,7 @@ def _core_metrics(core: object) -> dict:
             if stderr is None:
                 stderr = math.sqrt(acc * (1.0 - acc) / n) if n > 0 else None
             scored.append({"accuracy": acc, "n": n, "stderr": stderr})
+            acc_by_task[name] = acc
         except (TypeError, ValueError):
             pass
 
@@ -209,7 +226,8 @@ def _core_metrics(core: object) -> dict:
     if task_count is None and scored:
         task_count = len(scored)
 
-    return {"accuracy": accuracy, "stderr": stderr, "n": total_n, "task_count": task_count}
+    return {"accuracy": accuracy, "stderr": stderr, "n": total_n,
+            "task_count": task_count, "centered": _centered_core(acc_by_task)}
 
 
 def load_results(runs_root: str, grid: list[GridPoint]) -> list[dict]:
@@ -238,6 +256,7 @@ def load_results(runs_root: str, grid: list[GridPoint]) -> list[dict]:
             "actual_flops": p.actual_flops,
             "val_bpb": val_bpb,
             "core_acc": core_metrics["accuracy"],
+            "core_centered": core_metrics["centered"],
             "core_stderr": core_metrics["stderr"],
             "core_n": core_metrics["n"],
             "core_task_count": core_metrics["task_count"],
@@ -341,8 +360,9 @@ def fit_chinchilla(results: list[dict]) -> dict:
 def write_csv(results: list[dict], path: str) -> None:
     fields = ["task_id", "kind", "run_name", "flop_budget", "depth", "params",
               "actual_train_tokens", "actual_flops", "val_bpb", "core_acc",
-              "core_stderr", "core_n", "core_task_count", "train_time_hours",
-              "total_wall_hours", "steady_state_step_s", "aggregate_tok_s", "source"]
+              "core_centered", "core_stderr", "core_n", "core_task_count",
+              "train_time_hours", "total_wall_hours", "steady_state_step_s",
+              "aggregate_tok_s", "source"]
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
@@ -468,8 +488,37 @@ def plot_miniseries_loss(results: list[dict], png_path: str) -> None:
     print(f"[plot] saved {png_path}")
 
 
+# Zero-shot accuracy of GPT-2 / GPT-3 checkpoints on the SAME four tasks as our
+# CORE subset (piqa, arc_easy, arc_challenge, hellaswag), so the reference lines
+# live in the same metric space as our points once chance-centered.
+# GPT-3: Brown et al. 2020 (arXiv:2005.14165), zero-shot results.
+# GPT-2: EleutherAI lm-evaluation-harness zero-shot `acc` (community evals).
+CORE4_REFERENCES: list[dict] = [
+    # label, family, {piqa, arc_easy, arc_challenge, hellaswag} in [0, 1]
+    {"label": "GPT-2 124M", "family": "gpt2",
+     "acc": {"piqa": 0.629, "arc_easy": 0.438, "arc_challenge": 0.227, "hellaswag": 0.289}},
+    {"label": "GPT-2 1.5B", "family": "gpt2",
+     "acc": {"piqa": 0.705, "arc_easy": 0.583, "arc_challenge": 0.250, "hellaswag": 0.400}},
+    {"label": "GPT-3 125M", "family": "gpt3",
+     "acc": {"piqa": 0.646, "arc_easy": 0.436, "arc_challenge": 0.266, "hellaswag": 0.337}},
+    {"label": "GPT-3 1.3B", "family": "gpt3",
+     "acc": {"piqa": 0.751, "arc_easy": 0.538, "arc_challenge": 0.355, "hellaswag": 0.547}},
+    {"label": "GPT-3 6.7B", "family": "gpt3",
+     "acc": {"piqa": 0.780, "arc_easy": 0.602, "arc_challenge": 0.414, "hellaswag": 0.674}},
+    {"label": "GPT-3 175B", "family": "gpt3",
+     "acc": {"piqa": 0.810, "arc_easy": 0.688, "arc_challenge": 0.514, "hellaswag": 0.789}},
+]
+
+
 def plot_miniseries_core(results: list[dict], png_path: str) -> None:
-    """Plot 2: final CORE score vs training FLOPs and elapsed training time."""
+    """Plot 2: centered CORE score vs training FLOPs and elapsed training time.
+
+    Styled to match the nanochat miniseries figure (plot.png at the repo root):
+    chance-centered CORE on a 0-based y axis, plain green points labelled by
+    depth, a solid green log-linear fit over d>=12 extrapolated well past the
+    data, and dashed GPT-2 (blue) / GPT-3 (red) reference lines computed on
+    the same 4-task centered metric.
+    """
     import matplotlib
 
     matplotlib.use("Agg")
@@ -479,7 +528,7 @@ def plot_miniseries_core(results: list[dict], png_path: str) -> None:
     miniseries_pts = sorted(
         [
             r for r in results
-            if r["kind"] == "miniseries" and r["core_acc"] is not None and r["actual_flops"] > 0
+            if r["kind"] == "miniseries" and r["core_centered"] is not None and r["actual_flops"] > 0
         ],
         key=lambda r: r["actual_flops"],
     )
@@ -487,93 +536,78 @@ def plot_miniseries_core(results: list[dict], png_path: str) -> None:
         print("[plot] no CORE scores yet; skipping CORE-vs-FLOPs figure.")
         return
 
-    total_ns = sorted({int(p["core_n"]) for p in miniseries_pts if p.get("core_n")})
-    task_counts = sorted({int(p["core_task_count"]) for p in miniseries_pts if p.get("core_task_count")})
-    subtitle = ""
-    if total_ns and task_counts:
-        n_text = str(total_ns[0]) if len(total_ns) == 1 else f"{total_ns[0]}-{total_ns[-1]}"
-        t_text = str(task_counts[0]) if len(task_counts) == 1 else f"{task_counts[0]}-{task_counts[-1]}"
-        subtitle = f"{n_text} examples across {t_text} tasks per point"
+    fig, axes = plt.subplots(1, 2, figsize=(15, 5))
 
-    fig, axes = plt.subplots(1, 2, figsize=(15, 5), sharey=True)
-    color = "seagreen"
+    ref_rows = [
+        {
+            "label": ref["label"],
+            "family": ref["family"],
+            "core": _centered_core(ref["acc"]),
+        }
+        for ref in CORE4_REFERENCES
+    ]
+    y_hi = max(0.5, max(r["core"] for r in ref_rows) + 0.04)
 
     def add_panel(ax, *, x_key: str, xlabel: str, title: str) -> None:
+        ax.set_title(title)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel("CORE Score")
         panel_pts = [p for p in miniseries_pts if p.get(x_key) is not None and float(p[x_key]) > 0]
         if not panel_pts:
             ax.text(0.5, 0.5, "timing unavailable", ha="center", va="center", transform=ax.transAxes)
-            ax.set_title(title)
-            ax.set_xlabel(xlabel)
-            ax.set_ylabel("CORE Score")
             return
 
         xs = np.asarray([float(p[x_key]) for p in panel_pts], dtype=float)
-        ys = np.asarray([float(p["core_acc"]) for p in panel_pts], dtype=float)
-        yerr = np.asarray(
-            [float(p["core_stderr"] or 0.0) for p in panel_pts],
-            dtype=float,
-        )
+        ys = np.asarray([float(p["core_centered"]) for p in panel_pts], dtype=float)
         depths = [int(p["depth"]) for p in panel_pts]
 
-        ax.plot(xs, ys, "-", color=color, lw=1.2, alpha=0.8, zorder=2)
-        ax.errorbar(
-            xs,
-            ys,
-            yerr=yerr,
-            fmt="o",
-            color=color,
-            ecolor="mediumseagreen",
-            markeredgecolor="black",
-            markeredgewidth=0.7,
-            markersize=8,
-            elinewidth=1.0,
-            capsize=3,
-            label="JAXChat miniseries (d10-d20)",
-            zorder=3,
-        )
+        # Extend the x axis well past the data so the reference lines and the
+        # extrapolated fit have room to breathe (nanochat-style).
+        x_left = 10 ** (math.log10(xs.min()) - 0.2)
+        x_right = 10 ** (math.log10(xs.max()) + 3.0)
+
+        family_colors = {"gpt2": "tab:blue", "gpt3": "tab:red"}
+        for ref in ref_rows:
+            col = family_colors[ref["family"]]
+            ax.axhline(ref["core"], color=col, ls="--", lw=0.9, alpha=0.55, zorder=0)
+            ax.annotate(ref["label"], (0.99, ref["core"]),
+                        xycoords=("axes fraction", "data"),
+                        xytext=(0, 3), textcoords="offset points",
+                        ha="right", fontsize=7, color=col, alpha=0.9)
+
+        ax.plot(xs, ys, "o", color="mediumseagreen", markeredgecolor="black",
+                markeredgewidth=0.7, markersize=7,
+                label="JAXChat miniseries (d10-d20)", zorder=3)
         for x, y, depth in zip(xs, ys, depths):
             ax.annotate(f"d{depth}", (x, y), xytext=(4, 3), textcoords="offset points",
-                        fontsize=8, color="dimgray")
+                        fontsize=7, color="dimgray")
 
-        fit_mask = np.asarray([depth >= 12 for depth in depths], dtype=bool)
-        if fit_mask.sum() >= 2 and np.all(xs[fit_mask] > 0):
+        fit_mask = np.asarray([d >= 12 for d in depths])
+        if int(fit_mask.sum()) >= 2:
             slope, intercept = np.polyfit(np.log10(xs[fit_mask]), ys[fit_mask], 1)
-            fit_x = np.logspace(
-                math.log10(xs[fit_mask].min()) - 0.05,
-                math.log10(xs[fit_mask].max()) + 0.25,
-                100,
-            )
+            fit_x = np.logspace(math.log10(x_left), math.log10(x_right), 100)
             fit_y = slope * np.log10(fit_x) + intercept
-            ax.plot(fit_x, fit_y, "-", color="forestgreen", lw=2.0,
-                    label="Fit (d>=12)", zorder=1)
+            ax.plot(fit_x, fit_y, "-", color="forestgreen", lw=1.6,
+                    label="Fit (d>=12)", zorder=2)
 
         ax.set_xscale("log")
-        ax.set_xlabel(xlabel)
-        ax.set_ylabel("CORE Score")
-        ax.set_title(title)
-        ax.grid(True, which="both", alpha=0.3)
-        ax.legend(fontsize=9, loc="upper left")
+        ax.set_xlim(x_left, x_right)
+        ax.set_ylim(0.0, y_hi)
+        ax.legend(fontsize=8, loc="upper left")
 
     add_panel(
         axes[0],
         x_key="actual_flops",
-        xlabel="Training FLOPs",
+        xlabel="FLOPs",
         title="CORE vs Training FLOPs",
     )
     add_panel(
         axes[1],
         x_key="train_time_hours",
-        xlabel="Training Time (hours, 8xRTX6000)",
+        xlabel="Time (hours, 8xRTX6000)",
         title="CORE vs Training Time",
     )
 
-    ys = [float(p["core_acc"]) for p in miniseries_pts]
-    yerrs = [float(p["core_stderr"] or 0.0) for p in miniseries_pts]
-    y_min = max(0.0, min(y - e for y, e in zip(ys, yerrs)) - 0.03)
-    y_max = min(0.5, max(y + e for y, e in zip(ys, yerrs)) + 0.04)
-    axes[0].set_ylim(y_min, y_max)
-    if subtitle:
-        fig.suptitle(f"JAXChat CORE scaling ({subtitle})", y=1.02)
     fig.tight_layout()
     fig.savefig(png_path, dpi=150, bbox_inches="tight")
     print(f"[plot] saved {png_path}")

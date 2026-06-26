@@ -24,8 +24,10 @@
 # computed in a separate pass so only one logits tensor is live in the
 # differentiated update.
 #
-# Default RL knobs match the run that OOM'd (M=4, G=8, 256 new tokens, 80 iters)
-# so a clean finish here is a true confirmation. Override at submit time, e.g.:
+# Default RL knobs use the known-good depth-20 fit (M=4, G=4, 256 new tokens,
+# 80 iters) confirmed by job 100123. G=8 (B=32) OOM'd at 22 GiB even with the
+# crop+ref-split fix (job 99771); do not raise G past 4 on 24 GiB cards.
+# Override at submit time, e.g.:
 #   sbatch --export=ALL,RL_N_ITERS=4,RL_M_PROMPTS=2 \
 #     /project/inniang/jaxchat/runs/rtx_8gpu_0p5b_rl_chinchilla.sh
 # ============================================================================
@@ -59,7 +61,7 @@ RL_DATA_VAL="${RL_DATA_VAL:-${E2E_ROOT}/rl/gsm8k_test_200.jsonl}"
 # RL knobs — default to the job-80387 settings that OOM'd.
 RL_N_ITERS="${RL_N_ITERS:-80}"
 RL_M_PROMPTS="${RL_M_PROMPTS:-4}"
-RL_G_ROLLOUTS="${RL_G_ROLLOUTS:-8}"
+RL_G_ROLLOUTS="${RL_G_ROLLOUTS:-4}"
 RL_MAX_NEW_TOKENS="${RL_MAX_NEW_TOKENS:-256}"
 CORE_N="${CORE_N:-1000}"
 FINAL_GSM8K_N="${FINAL_GSM8K_N:-100}"

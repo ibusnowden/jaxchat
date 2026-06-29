@@ -63,7 +63,20 @@ def precompute_bigram_buckets(
     """Precompute a random hash table mapping (token_i, token_{i+1}) → bucket.
 
     Returns a (vocab_size, vocab_size) uint16 array.
+
+    The table is O(vocab^2) in memory: vocab=32768 → 2 GiB, vocab=65536 → 8 GiB.
+    For large vocabs, prefer disabling ``bigram_hash_embed`` (as the 0p56b-rust65k
+    preset does) or switching to an on-the-fly hash (not yet implemented).
     """
+    table_bytes = vocab_size * vocab_size * 2  # uint16
+    table_gib = table_bytes / (1024 ** 3)
+    if table_gib > 4.0:
+        raise ValueError(
+            f"precompute_bigram_buckets: (vocab_size={vocab_size}, vocab_size) uint16 "
+            f"table is {table_gib:.1f} GiB — too large to materialize on the host. "
+            f"Set config.bigram_hash_embed=False (the 0p56b-rust65k preset already does this), "
+            f"or reduce vocab_size."
+        )
     rng = np.random.default_rng(seed)
     buckets = rng.integers(0, n_buckets, size=(vocab_size, vocab_size), dtype=np.uint16)
     return buckets

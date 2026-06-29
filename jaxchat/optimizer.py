@@ -134,9 +134,25 @@ def power_iteration(matrix: jax.Array, n_iters: int = 5) -> jax.Array:
 
     Returns:
         Top eigenvalue estimate, scalar per batch.
+
+    The init vector is drawn from a fixed PRNG key derived from the matrix
+    shape so it is reproducible across steps but not constant — an all-ones
+    init fails to converge for any matrix whose top singular vector is
+    orthogonal to the ones vector (which is most of them).
     """
-    # Start with a random vector of size N (columns of G)
-    vec = jnp.ones_like(matrix[..., 0, :])  # shape (..., N)
+    n = matrix.shape[-1]
+    # Deterministic shape-derived seed: stable across steps and processes,
+    # varies across matrix shapes so different matrices get different inits.
+    seed = 0
+    for dim in matrix.shape:
+        seed = (seed * 1000003 + int(dim)) & 0x7FFFFFFF
+    key = jax.random.key(seed)
+    # vec is the right-eigenvector of G^T G, so it lives in R^N (the last axis of
+    # `matrix`). Drop BOTH matrix axes (M, N) and re-append N — i.e. shape
+    # ``(..., N)``. Using ``matrix.shape[:-1] + (n,)`` would wrongly keep the M
+    # axis and yield ``(..., M, N)``, corrupting the einsums below.
+    vec = jax.random.normal(key, matrix.shape[:-2] + (n,), dtype=matrix.dtype)
+    vec = vec / (jnp.linalg.norm(vec, axis=-1, keepdims=True) + 1e-10)
     for _ in range(n_iters):
         # v = G^T G v
         # G: (..., M, N), v: (..., N) -> Gv: (..., M) -> G^T(Gv): (..., N)
@@ -527,14 +543,16 @@ def make_soap(config, params, mesh):
     }
 
     def _soap_init_for_shape(shape, n_matrices):
-        """Initialize SOAP state for matrices of a given shape."""
+        """Initialize SOAP state for matrices of a given shape.
+
+        Moments (m, v) live in the eigenbasis of G^T G, which is (rank, rank) —
+        same shape as grad_proj = Q_left.T @ grad @ Q_right.
+        """
         M, N = shape
         rank = min(soap_rank, M, N)
         return {
-            "m_left": jnp.zeros((n_matrices, M, rank), dtype=jnp.float32),
-            "m_right": jnp.zeros((n_matrices, N, rank), dtype=jnp.float32),
-            "v_left": jnp.zeros((n_matrices, M, rank), dtype=jnp.float32),
-            "v_right": jnp.zeros((n_matrices, N, rank), dtype=jnp.float32),
+            "m": jnp.zeros((n_matrices, rank, rank), dtype=jnp.float32),
+            "v": jnp.zeros((n_matrices, rank, rank), dtype=jnp.float32),
             "Q_left": jnp.eye(M, rank, dtype=jnp.float32)[None, :, :].repeat(n_matrices, axis=0),
             "Q_right": jnp.eye(N, rank, dtype=jnp.float32)[None, :, :].repeat(n_matrices, axis=0),
             "step": jnp.zeros((n_matrices,), dtype=jnp.int32),
@@ -552,36 +570,39 @@ def make_soap(config, params, mesh):
         return state
 
     def _compute_soap_update(grad, global_step, soap_state_for_group):
-        """Compute Adam in the eigenbasis of G^T G."""
-        M, N = grad.shape
-        rank = soap_state_for_group["Q_left"].shape[-1]
+        """Compute Adam in the eigenbasis of G^T G, then project back to params.
+
+        Standard SOAP (https://arxiv.org/abs/2409.11321): project the gradient
+        into the eigenbasis of G^T G via Q_left, Q_right; run Adam there; project
+        the update back to the parameter basis with Q_left @ update @ Q_right.T.
+        The previous version skipped the back-projection, so updates were applied
+        in the eigenbasis coordinate frame — wrong coordinate system.
+        """
         Q_left = soap_state_for_group["Q_left"]  # (M, rank)
         Q_right = soap_state_for_group["Q_right"]  # (N, rank)
 
-        # Project gradient into eigenbasis
-        grad_proj = jnp.einsum('mi,mn,nj->ij', Q_left.T, grad, Q_right)  # (rank, rank)
+        # Project gradient into eigenbasis: grad_proj = Q_left.T @ grad @ Q_right
+        # Q_left.T is (rank, M), grad is (M, N), Q_right is (N, rank) -> (rank, rank).
+        # Label Q_left.T as 'im' (i=rank, m=M) so 'm' matches grad's M axis.
+        grad_proj = jnp.einsum('im,mn,nj->ij', Q_left.T, grad, Q_right)  # (rank, rank)
 
-        # Adam in eigenbasis
-        beta1 = jnp.asarray(config.embed_beta1 if labels[0] == "adam_embed" else 0.9, dtype=jnp.float32)
+        # Adam in eigenbasis (uses SOAP's own beta1, not the AdamW embed beta1)
+        beta1 = jnp.asarray(config.soap_beta1, dtype=jnp.float32)
         gs = global_step.astype(jnp.float32)
-        m_prev_left = soap_state_for_group["m_left"]
-        m_prev_right = soap_state_for_group["m_right"]
-        v_prev_left = soap_state_for_group["v_left"]
-        v_prev_right = soap_state_for_group["v_right"]
+        m_prev = soap_state_for_group["m"]
+        v_prev = soap_state_for_group["v"]
 
-        # Factorized moment accumulation
-        m_left = beta1 * m_prev_left + (1.0 - beta1) * grad @ Q_right
-        m_right = beta1 * m_prev_right + (1.0 - beta1) * grad.T @ Q_left
-        v_left = soap_beta2 * v_prev_left + (1.0 - soap_beta2) * (grad @ Q_right) ** 2
-        v_right = soap_beta2 * v_prev_right + (1.0 - soap_beta2) * (grad.T @ Q_left) ** 2
+        m = beta1 * m_prev + (1.0 - beta1) * grad_proj
+        v = soap_beta2 * v_prev + (1.0 - soap_beta2) * grad_proj ** 2
 
-        m_hat_left = m_left / (1.0 - beta1 ** (gs + 1.0))
-        m_hat_right = m_right / (1.0 - beta1 ** (gs + 1.0))
-        v_hat_left = v_left / (1.0 - soap_beta2 ** (gs + 1.0))
-        v_hat_right = v_right / (1.0 - soap_beta2 ** (gs + 1.0))
+        m_hat = m / (1.0 - beta1 ** (gs + 1.0))
+        v_hat = v / (1.0 - soap_beta2 ** (gs + 1.0))
 
-        update = (m_hat_left / (jnp.sqrt(v_hat_left) + config.adam_eps)) @ (m_hat_right / (jnp.sqrt(v_hat_right) + config.adam_eps)).T
-        return update, {"m_left": m_left, "m_right": m_right, "v_left": v_left, "v_right": v_right}
+        # Adam update in eigenbasis
+        update_proj = m_hat / (jnp.sqrt(v_hat) + config.adam_eps)
+        # Project back to parameter basis: update = Q_left @ update_proj @ Q_right.T
+        update = jnp.einsum('mi,ij,nj->mn', Q_left, update_proj, Q_right)
+        return update, {"m": m, "v": v}
 
     def _update_eigenbasis(grad, soap_state_for_group):
         """Update eigenbasis estimate via power iteration on G^T G."""
@@ -602,7 +623,15 @@ def make_soap(config, params, mesh):
             vec_right = grad.T @ (grad @ vec_right)
             vec_right = vec_right / (jnp.linalg.norm(vec_right, axis=-2, keepdims=True) + 1e-10)
 
-        return {"Q_left": vec_left, "Q_right": vec_right}
+        # Carry m/v through so this branch has the same pytree structure as the
+        # false branch (which returns the full per_mat_state dict). jax.lax.cond
+        # requires both branches to return identical pytree structure.
+        return {
+            "m": soap_state_for_group["m"],
+            "v": soap_state_for_group["v"],
+            "Q_left": vec_left,
+            "Q_right": vec_right,
+        }
 
     def update_fn(grads, params, state):
         grad_leaves = tree_flatten(grads)[0]
@@ -648,10 +677,8 @@ def make_soap(config, params, mesh):
         for (shape, indices) in soap_group_specs:
             group_key = f"soap_{shape}"
             old_soap_state = state[group_key]
-            new_soap_m_left = []
-            new_soap_m_right = []
-            new_soap_v_left = []
-            new_soap_v_right = []
+            new_soap_m = []
+            new_soap_v = []
             new_Q_left = []
             new_Q_right = []
 
@@ -661,10 +688,8 @@ def make_soap(config, params, mesh):
 
                 # Per-matrix SOAP state
                 per_mat_state = {
-                    "m_left": old_soap_state["m_left"][local_idx],
-                    "m_right": old_soap_state["m_right"][local_idx],
-                    "v_left": old_soap_state["v_left"][local_idx],
-                    "v_right": old_soap_state["v_right"][local_idx],
+                    "m": old_soap_state["m"][local_idx],
+                    "v": old_soap_state["v"][local_idx],
                     "Q_left": old_soap_state["Q_left"][local_idx],
                     "Q_right": old_soap_state["Q_right"][local_idx],
                 }
@@ -684,18 +709,14 @@ def make_soap(config, params, mesh):
                 new_param = param - soap_lr * (update + decay)
                 new_leaves[leaf_idx] = new_param.astype(param_leaves[leaf_idx].dtype)
 
-                new_soap_m_left.append(new_moments["m_left"])
-                new_soap_m_right.append(new_moments["m_right"])
-                new_soap_v_left.append(new_moments["v_left"])
-                new_soap_v_right.append(new_moments["v_right"])
+                new_soap_m.append(new_moments["m"])
+                new_soap_v.append(new_moments["v"])
                 new_Q_left.append(per_mat_state["Q_left"])
                 new_Q_right.append(per_mat_state["Q_right"])
 
             new_state[group_key] = {
-                "m_left": jnp.stack(new_soap_m_left, axis=0),
-                "m_right": jnp.stack(new_soap_m_right, axis=0),
-                "v_left": jnp.stack(new_soap_v_left, axis=0),
-                "v_right": jnp.stack(new_soap_v_right, axis=0),
+                "m": jnp.stack(new_soap_m, axis=0),
+                "v": jnp.stack(new_soap_v, axis=0),
                 "Q_left": jnp.stack(new_Q_left, axis=0),
                 "Q_right": jnp.stack(new_Q_right, axis=0),
                 "step": old_soap_state["step"] + 1,

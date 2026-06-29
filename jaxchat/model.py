@@ -110,7 +110,7 @@ from jax import jit, value_and_grad, vmap
 from jax.lax import rsqrt, scan
 from jax.nn import relu
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
-from jax.tree_util import tree_flatten, tree_flatten_with_path, tree_leaves, tree_map, tree_unflatten
+from jax.tree_util import tree_flatten_with_path, tree_leaves, tree_map, tree_unflatten
 from collections import Counter
 from dataclasses import dataclass
 from functools import partial
@@ -310,10 +310,10 @@ class Config:
     muon_warmup_momentum_init: float = 0.85
     muon_warmup_momentum_final: float = 0.95
     muon_polar_iters: int = 5
-    muon_polar_every: int = 1  # update orthogonalization every N steps
     # --- SOAP ---
     soap_rank: int = 32
     soap_update_freq: int = 10
+    soap_beta1: float = 0.9
     soap_beta2: float = 0.95
     # --- Weight decay ---
     weight_decay_base: float = 0.2
@@ -1320,33 +1320,7 @@ def estimate_mfu_proxy(param_count: int, config: Config, steady_state_step_s: fl
     return effective_flops / (steady_state_step_s * total_peak_flops)
 
 
-# ---------------------------------------------------------------------------
-# Weight tying manager (delayed untying)
-# ---------------------------------------------------------------------------
-
-def maybe_untie_weights(params: Pytree, step: int, config: Config) -> Pytree:
-    """If using delayed weight tying and step >= untie_at_step, untie lm_head from wte.
-
-    Returns modified params (or same if no change needed).
-    """
-    if config.weight_tying != "delayed":
-        return params
-    if step < config.untie_at_step:
-        return params
-    # Check if already untied
-    if "lm_head" in params and "wte" in params:
-        # If lm_head is the same object as wte, they're tied
-        try:
-            tree_flatten(params["lm_head"])[0]
-            tree_flatten(params["wte"])[0]
-        except Exception:
-            return params
-        # We detect tying by checking if they share memory — in JAX we can't easily.
-        # Instead we track this via an attribute on the optimizer or a separate flag.
-    return params
-
-
 if __name__ == "__main__":
-    from training.train_base import main
+    from scripts.base_train import main
 
     raise SystemExit(main())

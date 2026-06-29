@@ -41,8 +41,8 @@ from jaxchat.tokenizer import (
 )
 from training.eval_base import evaluate_run
 from training.eval_tokenizer import evaluate_tokenizer
+from jaxchat.presets import DEFAULT_CONFIG
 from training.train_base import (
-    DEFAULT_CONFIG,
     train_loop,
     validate_training_assets,
 )

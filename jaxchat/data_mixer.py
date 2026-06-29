@@ -69,6 +69,16 @@ def build_doc_boundary_mask(
     For each position i (predicting token at i+1), the mask is 0 if
     token at i is the document separator (meaning the label at i is the
     start of a new document).  Otherwise it's 1.
+
+    Note on ``doc_sep_id``: the packed-sequence format from
+    ``data/cached_fineweb.py`` starts each packed sequence with a BOS token,
+    not a dedicated document-separator token.  ``Config.doc_sep_id`` defaults
+    to 0, which matches the BOS id of the fineweb tokenizers (``<|bos|>`` is
+    token id 1 in the 32k/65k tokenizers, but the 8k d4 tokenizer uses id 0).
+    If you switch to a tokenizer whose BOS id is not 0, you must set
+    ``Config.doc_sep_id`` to that BOS id (or to a real separator token id) —
+    otherwise cross-document masking will silently mask the wrong positions
+    (or no positions at all).
     """
     is_boundary = (idx == doc_sep_id).astype(jnp.float32)
     return 1.0 - is_boundary

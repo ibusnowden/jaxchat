@@ -12,7 +12,6 @@ Modernized with:
 
 from __future__ import annotations
 
-import argparse
 import dataclasses
 import datetime
 import glob
@@ -60,7 +59,6 @@ from jaxchat.model import (
     parameter_breakdown_from_params,
     precompute_token_bytes,
     train_step,
-    maybe_untie_weights,
 )
 from jaxchat.optimizer import get_lr_scale
 from jaxchat.schedules import get_shape_for_step
@@ -75,10 +73,13 @@ def _reported_param_count(breakdown: dict[str, int]) -> int:
 
 
 def _estimated_flops_per_token_for_report(config: Config, breakdown: dict[str, int]) -> float:
-    # Match the nanochat-style accounting used by the target report: dense params
-    # plus the token-feature table if the architecture excludes it from params.
+    # Match the nanochat-style accounting: 6 * dense params per token.
+    # bigram_hash_embed adds a (bigram_hash_buckets, d_model) table that participates
+    # in the forward pass (it's added to the token embedding) but is excluded from
+    # _reported_param_count because it's in the "extra" bucket. Include it in the
+    # FLOPs count when it's enabled.
     param_count = _reported_param_count(breakdown)
-    if not config.bigram_hash_embed and config.vocab_size == 65_536 and config.depth == 20:
+    if config.bigram_hash_embed:
         param_count += int(config.bigram_hash_buckets * config.d_model)
     return 6.0 * float(param_count)
 
@@ -550,109 +551,3 @@ def train_loop(
         )
         logger.flush()
 
-
-from jaxchat.presets import (
-    DEFAULT_CONFIG,
-    FINEWEB_32K_DIR,
-    FINEWEB_TOKENIZER_JSON,
-    FINEWEB_TRAIN_GLOB,
-    FINEWEB_VAL_BIN,
-    PRESET_1P384B_DEPTH24,
-    PRESETS,
-    SMOKE,
-)
-
-
-def build_config(args) -> tuple[Config, str]:
-    config = PRESETS[args.preset]
-    preset_name = args.preset
-    replace_kwargs = {}
-    if args.depth is not None:
-        replace_kwargs["depth"] = args.depth
-        preset_name = f"depth{args.depth}"
-    if args.input_bin:
-        replace_kwargs["input_bin"] = args.input_bin
-    if args.input_val_bin:
-        replace_kwargs["input_val_bin"] = args.input_val_bin
-    if args.tokenizer_json is not None:
-        replace_kwargs["tokenizer_json"] = args.tokenizer_json
-    if args.optimizer is not None:
-        replace_kwargs["optimizer"] = args.optimizer
-    if args.lr_schedule is not None:
-        replace_kwargs["lr_schedule"] = args.lr_schedule
-    if args.weight_tying is not None:
-        replace_kwargs["weight_tying"] = args.weight_tying
-    if replace_kwargs:
-        config = dataclasses.replace(config, **replace_kwargs)
-    return config, preset_name
-
-
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Train the JAX depth-driven base model")
-    parser.add_argument(
-        "--preset",
-        choices=tuple(PRESETS),
-        default="default",
-        help="Training preset to run.",
-    )
-    parser.add_argument(
-        "--depth",
-        type=int,
-        default=None,
-        help="Depth override. d_model derives as depth*64 and n_heads as d_model/128.",
-    )
-    parser.add_argument("--input-bin", default="", help="Override training shard glob.")
-    parser.add_argument("--input-val-bin", default="", help="Override validation shard glob.")
-    parser.add_argument(
-        "--tokenizer-json",
-        default=None,
-        help="Override tokenizer JSON used for token-byte accounting.",
-    )
-    parser.add_argument(
-        "--run-dir",
-        default=None,
-        help="Explicit output directory for train.log and checkpoints.",
-    )
-    parser.add_argument(
-        "--resume",
-        action="store_true",
-        help="If --run-dir already has a base checkpoint, resume from it.",
-    )
-    parser.add_argument(
-        "--smoke-iters",
-        type=int,
-        default=None,
-        help="Override n_train_iters for a quick wiring test.",
-    )
-    parser.add_argument(
-        "--optimizer",
-        choices=("muon_adamw", "normuon", "soap"),
-        default=None,
-        help="Optimizer to use (default: muon_adamw).",
-    )
-    parser.add_argument(
-        "--lr-schedule",
-        choices=("linear", "cosine", "wsd"),
-        default=None,
-        help="LR schedule type.",
-    )
-    parser.add_argument(
-        "--weight-tying",
-        choices=("none", "full", "delayed"),
-        default=None,
-        help="Weight tying mode.",
-    )
-    args = parser.parse_args(argv)
-    config, preset_name = build_config(args)
-    train_loop(
-        config,
-        preset_name=preset_name,
-        run_dir=args.run_dir,
-        resume=args.resume,
-        smoke_iters=args.smoke_iters,
-    )
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
